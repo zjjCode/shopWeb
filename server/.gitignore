@@ -1,0 +1,24 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# 运行期生成
+logs/
+*.log
+uploads/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+
+# 测试
+coverage/
+.nyc_output/
