@@ -1,0 +1,1691 @@
+// server/prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("SHOP__DB__URL")
+}
+
+// ============================================================================
+// 枚举定义
+// ============================================================================
+
+/// 用户角色
+enum UserRole {
+  USER
+  ADMIN
+  SUPER_ADMIN
+}
+
+/// 用户状态
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+/// [v2 变更] 后台管理员角色枚举 **已移除**（原 `AdminRole{ADMIN,SUPER_ADMIN}` 作废）。
+/// 后台权限改为动态 RBAC：`admin_users` ↔ `roles`（多对多）↔ `permissions`（多对多）。
+/// C 端 `UserRole` 保持静态枚举（guest 未登录 / USER 买家），不涉及后台权限。
+/// 迁移见 §10.3；RBAC 五表设计见 §3.10；迁移期兼容策略见 §10.3 注。
+
+/// [v2 新增] RBAC 角色状态
+enum RoleStatus {
+  ENABLED
+  DISABLED
+}
+
+/// [v2 新增] 数据权限范围（一期两档）
+enum DataScope {
+  ALL     // 全部数据
+  SELF    // 仅自己创建的数据（查询层统一注入 creator_id 过滤）
+}
+
+/// 后台管理员状态
+enum AdminStatus {
+  ACTIVE
+  DISABLED
+}
+
+/// 操作人类型（资金流水、库存流水、订单轨迹共用）
+enum OperatorType {
+  USER
+  ADMIN
+  SYSTEM
+}
+
+/// Token 主体类型（C 端用户 / 后台管理员，复用 refresh_tokens 表）
+enum SubjectType {
+  USER
+  ADMIN
+}
+
+/// 商品分类状态
+enum CategoryStatus {
+  ENABLED
+  DISABLED
+}
+
+/// 商品（SPU）状态。DRAFT/PENDING_AUDIT 为审核流预留（PRD P1），一期使用 ON_SALE/OFF_SALE
+enum ProductStatus {
+  DRAFT
+  PENDING_AUDIT
+  ON_SALE
+  OFF_SALE
+}
+
+/// SKU 状态
+enum SkuStatus {
+  ENABLED
+  DISABLED
+}
+
+/// 库存变动类型
+enum StockChangeType {
+  ORDER_FREEZE       // 下单冻结：available → frozen
+  ORDER_CONFIRM      // 支付确认：frozen → sold
+  ORDER_RELEASE      // 取消/超时释放：frozen → available
+  REFUND_RETURN      // 退款回仓：sold → available
+  MANUAL_IN          // 手工入库：→ available
+  MANUAL_LOSS        // 手工报损：available → 出账
+  MANUAL_CHECK       // 盘点修正（可正可负，修正 available）
+}
+
+/// 订单状态
+enum OrderStatus {
+  PENDING_PAYMENT    // 待支付
+  PAID               // 已支付（待发货）
+  SHIPPED            // 已发货（待收货）
+  COMPLETED          // 已完成
+  CANCELLED          // 已取消
+  REFUNDING          // 退款中
+  REFUNDED           // 已退款
+}
+
+/// 订单取消原因
+enum CancelReason {
+  USER_CANCEL
+  ADMIN_CANCEL
+  TIMEOUT
+  SYSTEM
+}
+
+/// 支付渠道
+/// [v2 变更] 新增 BALANCE（余额，本地记账不走外部渠道）、BANKCARD（银行卡，走聚合支付服务商）
+enum PayChannel {
+  MOCK       // 模拟支付（沙箱 / 生产降级）
+  ALIPAY     // 支付宝
+  WECHAT     // 微信支付
+  BANKCARD   // [v2] 银行卡（聚合支付服务商：网关支付 / 快捷支付）
+  BALANCE    // [v2] 用户余额（本地事务，无外部调用）
+}
+
+/// [v2 新增] 子支付方式（同一渠道下的不同支付场景）
+enum SubChannel {
+  WEB        // 支付宝 PC 网页支付 / 银行卡网关
+  SCAN       // 支付宝当面付扫码 / 微信 Native
+  JSAPI      // 微信内 / 公众号
+  H5         // 非微信手机浏览器
+  GATEWAY    // 银行卡网关支付（跳转聚合商收银台选银行）
+  QUICK      // 银行卡快捷支付（绑卡 + 短信）
+  BALANCE    // 余额支付（与 channel=BALANCE 配对）
+}
+
+/// [v2 新增] 支付单业务类型：一张 payments 表同时承载「订单支付」与「余额充值」
+enum PaymentBizType {
+  ORDER      // 订单支付（关联 orders.order_no）
+  RECHARGE   // 余额充值（关联 recharge_orders.recharge_no）
+}
+
+/// [v2 新增] 充值单状态
+enum RechargeStatus {
+  PENDING    // 待支付
+  SUCCESS    // 充值成功（余额已到账）
+  CLOSED     // 已关闭（超时 30 分钟 / 用户取消）
+}
+
+/// 支付单状态
+enum PayStatus {
+  PENDING     // 待支付
+  SUCCESS     // 支付成功
+  CLOSED      // 已关闭
+  FAILED      // 支付失败
+  REFUNDED    // 已全额退款
+}
+
+/// 退款类型
+enum RefundType {
+  FULL
+  PARTIAL
+}
+
+/// 退款单状态
+enum RefundStatus {
+  PENDING     // 待审核
+  REJECTED    // 已驳回
+  PROCESSING  // 退款中（已调渠道）
+  SUCCESS     // 退款成功
+  FAILED      // 退款失败（可重试）
+}
+
+/// [v2 新增] 退款去向（单一支付方式下，退款去向唯一，不存在拆分）
+enum RefundTarget {
+  BALANCE    // 退回用户余额账户（本地事务，即时到账）
+  CHANNEL    // 原路退回原渠道（调渠道 refund）
+}
+
+/// [v2 新增] 渠道回调处理状态（回调接口只落日志 + 投递队列，由 Worker 消费）
+enum PaymentNotifyStatus {
+  RECEIVED   // 已收回调（已落 integration_call_logs）
+  QUEUED     // 已投递 BullMQ
+  CONSUMED   // Worker 已成功消费并完成入账事务
+  SKIPPED    // 重复通知被幂等跳过
+  DEAD       // 重试耗尽，进入死信，需人工介入
+}
+
+/// 资金方向：IN = 入账，OUT = 出账
+enum FundDirection {
+  IN
+  OUT
+}
+
+/// 资金业务类型
+/// [v2 变更] 由 10 类扩到 21 类。新增部分分三组：
+///   ① 用户余额账户（USER_BALANCE）流水；② 平台侧充值收款（负债）；
+///   ③ 负债结转对（LIABILITY_SETTLE_IN / LIABILITY_SETTLE_OUT，必须成对、共享 tx_group_no）
+/// ⚠️ LIABILITY_SETTLE_OUT 必须**晚于** LIABILITY_SETTLE_IN 写入（先 IN 后 OUT），
+///    否则中间态可能触发 fund_accounts 的 CHECK(balance >= 0)。详见 §3.6.4。
+enum FundBizType {
+  // ---- v1 原有（订单/退款/调账，记在 PLATFORM_CASH 账户）----
+  ORDER_PAY            // 渠道支付订单入账（IN）
+  ORDER_REFUND         // 订单整单退款（OUT）
+  ORDER_REFUND_PART    // 订单部分退款（OUT）
+  ORDER_CANCEL_REFUND  // 已支付订单取消退款（OUT）
+  CHANNEL_FEE          // 支付渠道手续费（OUT）
+  FREIGHT_ADD          // 运费补收（IN）
+  FREIGHT_REFUND       // 运费退还（OUT）
+  MANUAL_ADJUST_IN     // 手工调账-补记（IN）
+  MANUAL_ADJUST_OUT    // 手工调账-冲减（OUT）
+  REVERSAL             // 冲正流水（与原流水反向，related_tx_no 必填）
+
+  // ---- [v2] 充值侧 ----
+  PLATFORM_RECHARGE_IN   // 充值：平台账户收到渠道款项（IN，is_liability=true，是负债不是收入）
+  BALANCE_RECHARGE       // 充值：用户余额账户入账（IN）
+  BALANCE_GIFT           // 充值赠送：用户余额账户入账（IN，对应平台侧记营销费用，不进收入）
+
+  // ---- [v2] 消费 / 退款侧（USER_BALANCE 账户）----
+  BALANCE_CONSUME        // 余额支付订单（OUT）
+  BALANCE_ROLLBACK       // 余额支付失败/关单回滚（IN）
+  BALANCE_REFUND         // 退款退回余额（IN）
+  BALANCE_ADJUST_IN      // 余额手工调账-补记（IN，super_admin，必填原因）
+  BALANCE_ADJUST_OUT     // 余额手工调账-冲减（OUT，super_admin，必填原因）
+  BALANCE_WITHDRAW       // 余额提现（OUT，一期不做，占位）
+
+  // ---- [v2] 负债结转对（记在 PLATFORM_CASH 账户，必须成对）----
+  LIABILITY_SETTLE_IN    // 结转：负债转收入（IN，is_liability=false，先写）
+  LIABILITY_SETTLE_OUT   // 结转：冲减负债（OUT，is_liability=true，后写）
+}
+
+/// 账户类型
+/// [v2 变更] 由「一期只有 PLATFORM_CASH」改为「PLATFORM_CASH（1 条）+ USER_BALANCE（每用户 1 条）」。
+/// POINT 为二阶段积分账户预留扩展位，一期不建账户。
+enum FundAccountType {
+  PLATFORM_CASH   // 平台现金账户（全局 1 条）；其「余额」= 平台实际持有的现金
+  USER_BALANCE    // [v2] 用户余额负债账户（每用户 1 条）；其「余额」= 平台对该用户的负债
+  POINT           // 二阶段积分账户预留
+}
+
+/// 资金账户状态
+/// [v2 变更] FROZEN 由「预留」变为「实际可用」：风控/争议场景下冻结用户余额账户
+enum AccountStatus {
+  ACTIVE
+  FROZEN
+}
+
+// ============================================================================
+// [v2 新增] 优惠券 / 促销域枚举
+// ============================================================================
+
+/// 券类型
+enum CouponType {
+  FULL_REDUCE    // 满减券：threshold_amount(>0) + discount_amount(分)
+  DISCOUNT       // 折扣券：threshold_amount + discount_rate(万分比) + max_discount(必填)
+  NO_THRESHOLD   // 无门槛券：threshold_amount 恒 0 + discount_amount(分)
+}
+
+/// 券有效期策略（两种互斥）
+enum CouponValidType {
+  FIXED_RANGE    // 固定时间段：valid_start ~ valid_end
+  AFTER_CLAIM    // 领取后 N 天有效：valid_days，领取时算 expire_at
+}
+
+/// 券模板状态（运营侧生命周期）
+enum CouponTemplateStatus {
+  NOT_START   // 未开始（已创建但未到 claim_start_at）
+  CLAIMABLE   // 可领取
+  PAUSED      // 已暂停（运营手动）
+  ENDED       // 已结束（到 claim_end_at 或发完）
+}
+
+/// 券实例状态（用户侧生命周期，见 05-PRD-变更 §2.3.2 状态机）
+enum CouponStatus {
+  UNUSED       // 已领取·未使用
+  LOCKED       // 已占用·锁定（提交订单时占用，与订单同事务）
+  USED         // 已使用（支付成功）
+  EXPIRED      // 已过期（定时任务批量置位）
+  INVALIDATED  // 已作废（运营整批作废）
+}
+
+/// 券轨迹业务动作
+enum CouponLogBizType {
+  CLAIM      // 领取
+  LOCK       // 下单占用
+  UNLOCK     // 解冻（取消/超时/支付失败）
+  USE        // 核销（支付成功）
+  RESTORE    // 退款返还（整单退款）
+  EXPIRE     // 过期
+  INVALIDATE // 运营作废
+}
+
+/// 适用范围类型（券模板与促销活动共用语义，各自一张关联表）
+enum ScopeType {
+  ALL               // 全场通用
+  CATEGORY          // 指定分类
+  PRODUCT           // 指定商品（SPU）
+  EXCLUDE_PRODUCT   // 排除商品（SKU/SPU 黑名单）
+}
+
+/// 促销活动类型
+enum PromotionType {
+  FULL_REDUCE    // 满减：订单级，满 N 分减 M 分，可阶梯
+  FULL_DISCOUNT  // 满折：行级，参与商品打 X 折（discount_rate 万分比）
+  FLASH_SALE     // 限时折扣：行级，指定商品按折扣价/固定价销售
+}
+
+/// 促销活动作用层级
+enum PromotionLevel {
+  ORDER   // 订单级（满减）：优惠需分摊到行
+  ROW     // 行级（满折 / 限时折扣）：天然归属该行，无需分摊
+}
+
+/// 促销活动状态
+enum PromotionStatus {
+  DRAFT     // 草稿
+  ENABLED   // 已启用
+  DISABLED  // 已停用
+  ENDED     // 已结束
+}
+
+/// [v2 新增] 支付方式（后台可配置）状态
+enum PaymentMethodStatus {
+  NORMAL      // 正常，可选
+  MAINTAINING // 维护中（展示但不可选，带提示文案）
+}
+
+/// 幂等记录状态
+enum IdempotencyStatus {
+  PROCESSING
+  SUCCESS
+  FAILED
+}
+
+/// 文件存储类型
+enum StorageType {
+  LOCAL
+  OSS
+}
+
+/// 第三方适配器类型
+enum AdapterType {
+  PAYMENT
+  LOGISTICS
+  SUPPORT
+  SMS
+}
+
+/// 后台操作结果
+enum OpResult {
+  SUCCESS
+  FAIL
+}
+
+// ============================================================================
+// 用户域
+// ============================================================================
+
+/// 用户（C 端买家）
+model User {
+  id           BigInt     @id @default(autoincrement())
+  phone        String     @unique @db.VarChar(20)
+  email        String?    @db.VarChar(128)
+  passwordHash String     @map("password_hash") @db.VarChar(255)
+  /// [v2 新增] 支付密码（6 位数字，BCrypt 存储，独立于登录密码）—— BAL-06
+  /// NULL 表示未设置，余额支付前强制引导设置
+  payPasswordHash String? @map("pay_password_hash") @db.VarChar(255)
+  /// [v2 新增] 支付密码连续错误次数与锁定截止时间 —— BAL-06（错 5 次锁 30 分钟）
+  payPwdFailCount Int     @default(0) @map("pay_pwd_fail_count")
+  payPwdLockedUntil DateTime? @map("pay_pwd_locked_until") @db.DateTime(3)
+  nickname     String     @db.VarChar(64)
+  avatar       String?    @db.VarChar(512)
+  role         UserRole   @default(USER)
+  status       UserStatus @default(ACTIVE)
+  /// token 版本号：+1 即让该用户所有已签发 access token 失效（强制下线）
+  tokenVersion Int        @default(1) @map("token_version")
+  lastLoginAt  DateTime?  @map("last_login_at")
+  lastLoginIp  String?    @map("last_login_ip") @db.VarChar(64)
+  createdAt    DateTime   @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt    DateTime   @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt    DateTime?  @map("deleted_at") @db.DateTime(3)
+
+  addresses     Address[]
+  refreshTokens RefreshToken[]
+  cartItems     CartItem[]
+  orders        Order[]
+  payments      Payment[]
+  refunds       Refund[]
+  /// [v2 新增] 每用户 1 条 USER_BALANCE 账户（与注册同事务开户，见 §7.1 事务 H）
+  fundAccounts      FundAccount[]
+  /// [v2 新增]
+  coupons           Coupon[]
+  couponUseLogs     CouponUseLog[]
+  orderCouponRecords OrderCouponRecord[]
+  rechargeOrders    RechargeOrder[]
+
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@map("users")
+}
+
+/// 收货地址（软删除；订单保存下单时快照，删除地址不影响历史订单）
+model Address {
+  id            BigInt   @id @default(autoincrement())
+  userId        BigInt   @map("user_id")
+  receiverName  String   @map("receiver_name") @db.VarChar(64)
+  phone         String   @db.VarChar(20)
+  provinceCode  String   @map("province_code") @db.VarChar(20)
+  provinceName  String   @map("province_name") @db.VarChar(64)
+  cityCode      String   @map("city_code") @db.VarChar(20)
+  cityName      String   @map("city_name") @db.VarChar(64)
+  districtCode  String   @map("district_code") @db.VarChar(20)
+  districtName  String   @map("district_name") @db.VarChar(64)
+  detailAddress String   @map("detail_address") @db.VarChar(255)
+  /// 标签：HOME / COMPANY / SCHOOL
+  tag           String?  @db.VarChar(16)
+  isDefault     Boolean  @default(false) @map("is_default")
+  createdAt     DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt     DateTime? @map("deleted_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, deletedAt, createdAt])
+  @@index([userId, isDefault])
+  @@map("addresses")
+}
+
+/// 刷新令牌（C 端与后台共用，subjectType 区分）。只存 sha256 哈希，支持轮换与家族吊销
+model RefreshToken {
+  id           BigInt      @id @default(autoincrement())
+  subjectType  SubjectType @map("subject_type")
+  userId       BigInt?     @map("user_id")
+  adminId      BigInt?     @map("admin_id")
+  tokenHash    String      @unique @map("token_hash") @db.VarChar(128)
+  /// 轮换家族 ID：检测到重放时吊销整族
+  familyId     String      @map("family_id") @db.VarChar(64)
+  userAgent    String?     @map("user_agent") @db.VarChar(512)
+  ip           String?     @db.VarChar(64)
+  expiresAt    DateTime    @map("expires_at") @db.DateTime(3)
+  revokedAt    DateTime?   @map("revoked_at") @db.DateTime(3)
+  /// 轮换后指向的新记录 ID（不建外键，便于跨主体）
+  replacedById BigInt?     @map("replaced_by_id")
+  createdAt    DateTime    @default(now()) @map("created_at") @db.DateTime(3)
+
+  user  User?      @relation(fields: [userId], references: [id])
+  admin AdminUser? @relation(fields: [adminId], references: [id])
+
+  @@index([subjectType, userId, revokedAt])
+  @@index([subjectType, adminId, revokedAt])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ============================================================================
+// 商品域
+// ============================================================================
+
+/// 商品分类（最多三级树）。path = '/1/12/123/' 便于一次性取子树
+model Category {
+  id        BigInt         @id @default(autoincrement())
+  parentId  BigInt?        @map("parent_id")
+  name      String         @db.VarChar(64)
+  /// 层级：1 / 2 / 3
+  level     Int            @db.TinyInt
+  /// 层级路径，如 '/1/12/123/'，前缀匹配可查整棵子树
+  path      String         @db.VarChar(255)
+  sort      Int            @default(0)
+  icon      String?        @db.VarChar(512)
+  status    CategoryStatus @default(ENABLED)
+  createdAt DateTime       @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime       @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt DateTime?      @map("deleted_at") @db.DateTime(3)
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([parentId, sort])
+  @@index([path])
+  @@index([status, level, sort])
+  @@map("categories")
+}
+
+/// 商品 SPU
+model Product {
+  id         BigInt        @id @default(autoincrement())
+  categoryId BigInt        @map("category_id")
+  name       String        @db.VarChar(255)
+  subTitle   String?       @map("sub_title") @db.VarChar(255)
+  mainImage  String        @map("main_image") @db.VarChar(512)
+  /// 图文详情（HTML，入库前必须过 sanitize-html 白名单）
+  detail     String?       @db.Text
+  status     ProductStatus @default(DRAFT)
+  /// 冗余最低/最高售价（分），便于列表页展示，SKU 变动时同步更新
+  minPrice   BigInt        @default(0) @map("min_price")
+  maxPrice   BigInt        @default(0) @map("max_price")
+  totalSales Int           @default(0) @map("total_sales")
+  sort       Int           @default(0)
+  createdBy  BigInt?       @map("created_by")
+  createdAt  DateTime      @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt  DateTime      @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt  DateTime?     @map("deleted_at") @db.DateTime(3)
+
+  category Category       @relation(fields: [categoryId], references: [id])
+  skus     Sku[]
+  images   ProductImage[]
+  specs    ProductSpec[]
+
+  @@index([categoryId, status, sort])
+  @@index([status, createdAt])
+  @@index([deletedAt, name])
+  @@map("products")
+}
+
+/// 商品规格定义（如「颜色」= ["陨石黑","冰川银"]），用于后台生成 SKU 组合
+model ProductSpec {
+  id        BigInt   @id @default(autoincrement())
+  productId BigInt   @map("product_id")
+  /// 规格名，如「颜色」「版本」
+  name      String   @db.VarChar(64)
+  /// 规格值数组，JSON，如 ["陨石黑","冰川银"]
+  values    Json     @db.Json
+  sort      Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, sort])
+  @@map("product_specs")
+}
+
+/// 商品图集
+model ProductImage {
+  id        BigInt   @id @default(autoincrement())
+  productId BigInt   @map("product_id")
+  url       String   @db.VarChar(512)
+  sort      Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, sort])
+  @@map("product_images")
+}
+
+/// SKU（最小库存单位）
+model Sku {
+  id            BigInt    @id @default(autoincrement())
+  productId     BigInt    @map("product_id")
+  skuCode       String    @unique @map("sku_code") @db.VarChar(64)
+  /// 规格组合 JSON：{"颜色":"陨石黑","版本":"8G+128G"}
+  specValues    Json      @map("spec_values") @db.Json
+  /// 规格值按规格名排序后拼接（如 "颜色:陨石黑|版本:8G+128G"），用于同 SPU 下组合唯一与展示
+  specDigest    String    @map("spec_digest") @db.VarChar(255)
+  /// 售价（分）
+  price         BigInt
+  /// 划线原价（分），可空
+  originalPrice BigInt?   @map("original_price")
+  /// 成本价（分），仅后台可见
+  costPrice     BigInt    @default(0) @map("cost_price")
+  /// 重量（克），为 P1 按重量计费运费预留
+  weight        Int       @default(0)
+  barcode       String?   @db.VarChar(64)
+  imageUrl      String?   @map("image_url") @db.VarChar(512)
+  status        SkuStatus @default(ENABLED)
+  sales         Int       @default(0)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt     DateTime? @map("deleted_at") @db.DateTime(3)
+
+  product   Product      @relation(fields: [productId], references: [id])
+  stock     SkuStock?
+  cartItems CartItem[]
+  orderItems OrderItem[]
+  refundItems RefundItem[]
+  /// [T005 补齐] 设计文档 §2 未写这条反向关系，Prisma 校验要求关系必须成对，否则 P1012
+  stockLogs StockLog[]
+
+  @@unique([productId, specDigest], map: "uk_product_spec")
+  @@index([productId, status])
+  @@index([skuCode])
+  @@map("skus")
+}
+
+/// SKU 库存（三段口径 + 乐观锁）
+model SkuStock {
+  id       BigInt   @id @default(autoincrement())
+  skuId    BigInt   @unique @map("sku_id")
+  /// 总量 = available + frozen + sold（恒等式，由巡检任务校验）
+  total    Int      @default(0)
+  /// 可用库存（可售）
+  available Int     @default(0)
+  /// 冻结库存（待支付订单占用）
+  frozen   Int      @default(0)
+  /// 已售库存（已支付出库）
+  sold     Int      @default(0)
+  /// 库存预警阈值，低于此值后台列表高亮
+  warningThreshold Int @default(10) @map("warning_threshold")
+  /// 乐观锁版本号，每次变更 +1
+  version  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  sku Sku @relation(fields: [skuId], references: [id])
+
+  @@index([available])
+  @@index([skuId, version])
+  @@map("sku_stocks")
+}
+
+/// 库存流水（每次库存变动一条，含变动前后三段值）
+model StockLog {
+  id              BigInt           @id @default(autoincrement())
+  skuId           BigInt           @map("sku_id")
+  changeType      StockChangeType  @map("change_type")
+  /// 变动数量，带符号（冻结 +N / 释放 -N）
+  changeQty       Int              @map("change_qty")
+  beforeAvailable Int              @map("before_available")
+  afterAvailable  Int              @map("after_available")
+  beforeFrozen    Int              @map("before_frozen")
+  afterFrozen     Int              @map("after_frozen")
+  beforeSold      Int              @map("before_sold")
+  afterSold       Int              @map("after_sold")
+  /// 关联业务单号：订单号 / 退款单号 / 手工单号
+  bizNo           String?          @map("biz_no") @db.VarChar(64)
+  operatorType    OperatorType     @map("operator_type")
+  /// SYSTEM 时填 0
+  operatorId      BigInt           @map("operator_id")
+  operatorName    String?          @map("operator_name") @db.VarChar(64)
+  reason          String?          @db.VarChar(255)
+  /// 幂等号，NULL 时允许多条（MySQL 唯一索引允许多个 NULL）
+  idempotencyKey  String?          @map("idempotency_key") @db.VarChar(128)
+  createdAt       DateTime         @default(now()) @map("created_at") @db.DateTime(3)
+
+  sku Sku @relation(fields: [skuId], references: [id])
+
+  @@unique([skuId, idempotencyKey], map: "uk_sku_idem")
+  @@index([skuId, createdAt])
+  @@index([bizNo])
+  @@index([changeType, createdAt])
+  @@map("stock_logs")
+}
+
+// ============================================================================
+// 购物车
+// ============================================================================
+
+/// 购物车条目（登录后；未登录存 localStorage，登录后合并）
+model CartItem {
+  id            BigInt   @id @default(autoincrement())
+  userId        BigInt   @map("user_id")
+  skuId         BigInt   @map("sku_id")
+  quantity      Int
+  /// 是否勾选（未勾选不进入结算）
+  selected      Boolean  @default(true)
+  /// 加购时的单价快照（分），用于「价格已变动」提示
+  priceSnapshot BigInt   @map("price_snapshot")
+  createdAt     DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sku  Sku  @relation(fields: [skuId], references: [id])
+
+  @@unique([userId, skuId], map: "uk_user_sku")
+  @@index([userId, selected, updatedAt])
+  @@map("cart_items")
+}
+
+// ============================================================================
+// 订单域
+// ============================================================================
+
+/// 订单主表
+model Order {
+  id        BigInt      @id @default(autoincrement())
+  orderNo   String      @unique @map("order_no") @db.VarChar(32)
+  userId    BigInt      @map("user_id")
+  status    OrderStatus @default(PENDING_PAYMENT)
+
+  // ---- 金额（单位：分）----
+  /// 商品原价合计 = Σ 订单行 goodsAmount
+  goodsAmount      BigInt @map("goods_amount")
+  /// 运费
+  freightAmount    BigInt @default(0) @map("freight_amount")
+
+  // ---- [v2 变更] 优惠三级扣减（原 discountAmount 恒 0 单字段作废，见下）----
+  /// ① 行级促销优惠合计 = Σ order_items.promo_discount（限时折扣 / 满折）
+  rowPromoDiscount   BigInt @default(0) @map("row_promo_discount")
+  /// ② 订单级促销优惠（满减，已分摊到行）
+  orderPromoDiscount BigInt @default(0) @map("order_promo_discount")
+  /// ③ 优惠券优惠（已分摊到行）
+  couponDiscount     BigInt @default(0) @map("coupon_discount")
+  /// 积分抵扣（二阶段，一期恒 0）—— 保留，不参与 v2 恒等式
+  pointDeductAmount BigInt @default(0) @map("point_deduct_amount")
+
+  /// 应付金额 = goods - row_promo - order_promo - coupon + freight
+  /// ⚠️ 恒等式由 CHECK 约束保证（见 §2.1）
+  payAmount        BigInt @map("pay_amount")
+  /// 已退金额累计（校验防重复退款）
+  refundedAmount   BigInt @default(0) @map("refunded_amount")
+
+  // ---- [v2 变更] 支付方式（单一支付，无拆分金额字段）----
+  /// 支付方式：BALANCE / ALIPAY / WECHAT / BANKCARD / MOCK。下单时选定，支付后不可变
+  /// ⚠️ v1.1 明确取消混合支付：不再有 balance_paid / channel_paid 拆分字段
+  payMethod        PayChannel? @map("pay_method")
+  /// [v2 新增] 本单使用的券（整单限 1 张，CPN-09）；整单退款时据此返还
+  couponId         BigInt?     @map("coupon_id")
+  /// [v2 新增] 命中的订单级促销活动（冗余记录，便于售后复盘；行级活动记在 order_items）
+  promotionId      BigInt?     @map("promotion_id")
+
+  // ---- 收货地址快照（下单时固化，删除地址不影响历史订单）----
+  receiverName     String  @map("receiver_name") @db.VarChar(64)
+  receiverPhone    String  @map("receiver_phone") @db.VarChar(20)
+  receiverProvince String  @map("receiver_province") @db.VarChar(64)
+  receiverCity     String  @map("receiver_city") @db.VarChar(64)
+  receiverDistrict String  @map("receiver_district") @db.VarChar(64)
+  receiverAddress  String  @map("receiver_address") @db.VarChar(255)
+  addressTag       String? @map("address_tag") @db.VarChar(16)
+
+  // ---- 运费规则快照 ----
+  freeThreshold    BigInt? @map("free_threshold")
+
+  // ---- 关键时间 ----
+  /// 支付超时时间 = createdAt + order.payTimeoutMinutes
+  expireAt         DateTime  @map("expire_at") @db.DateTime(3)
+  paidAt           DateTime? @map("paid_at") @db.DateTime(3)
+  shippedAt        DateTime? @map("shipped_at") @db.DateTime(3)
+  completedAt      DateTime? @map("completed_at") @db.DateTime(3)
+  cancelledAt      DateTime? @map("cancelled_at") @db.DateTime(3)
+  /// 自动确认收货时间点 = shippedAt + autoConfirmDays
+  autoConfirmAt    DateTime? @map("auto_confirm_at") @db.DateTime(3)
+  /// 售后期截止 = completedAt + afterSaleDays
+  afterSaleExpireAt DateTime? @map("after_sale_expire_at") @db.DateTime(3)
+
+  cancelReason     CancelReason? @map("cancel_reason")
+  cancelNote       String?       @map("cancel_note") @db.VarChar(255)
+
+  // ---- 物流 ----
+  logisticsCompanyCode String? @map("logistics_company_code") @db.VarChar(32)
+  logisticsCompanyName String? @map("logistics_company_name") @db.VarChar(64)
+  logisticsNo          String? @map("logistics_no") @db.VarChar(64)
+
+  buyerRemark      String? @map("buyer_remark") @db.VarChar(255)
+  adminRemark      String? @map("admin_remark") @db.VarChar(255)
+  clientIp         String? @map("client_ip") @db.VarChar(64)
+  idempotencyKey   String? @map("idempotency_key") @db.VarChar(128)
+  /// 乐观锁，状态变更时 +1
+  version          Int     @default(0)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  /// C 端「删除订单」为软删除，后台仍可查
+  deletedAt        DateTime? @map("deleted_at") @db.DateTime(3)
+
+  user          User              @relation(fields: [userId], references: [id])
+  items         OrderItem[]
+  statusLogs    OrderStatusLog[]
+  payments      Payment[]
+  refunds       Refund[]
+  /// [v2 新增]
+  coupon        Coupon?             @relation(fields: [couponId], references: [id])
+  promotion     Promotion?          @relation(fields: [promotionId], references: [id])
+  couponRecord  OrderCouponRecord?
+
+  @@index([userId, status, createdAt])
+  @@index([userId, deletedAt, createdAt])
+  @@index([status, expireAt])
+  @@index([status, autoConfirmAt])
+  @@index([createdAt])
+  @@index([logisticsNo])
+  /// [v2 新增] 后台按支付方式筛选订单 / 对账按渠道汇总
+  @@index([payMethod, createdAt])
+  /// [v2 新增] 退款返还券时反查「哪些订单用了这张券」
+  @@index([couponId])
+  @@map("orders")
+}
+
+/// 订单行（商品/SKU 快照，事后改价改名不影响历史订单）
+model OrderItem {
+  id             BigInt   @id @default(autoincrement())
+  orderId        BigInt   @map("order_id")
+  productId      BigInt   @map("product_id")
+  skuId          BigInt   @map("sku_id")
+  /// 快照字段
+  skuCode        String   @map("sku_code") @db.VarChar(64)
+  productName    String   @map("product_name") @db.VarChar(255)
+  specDigest     String   @map("spec_digest") @db.VarChar(255)
+  mainImage      String   @map("main_image") @db.VarChar(512)
+  /// 成交单价（分）
+  unitPrice      BigInt   @map("unit_price")
+  originalPrice  BigInt?  @map("original_price")
+  quantity       Int
+  /// goodsAmount = unitPrice * quantity
+  goodsAmount    BigInt   @map("goods_amount")
+
+  // ---- [v2 变更] 行级优惠（原 discountAmount 恒 0 单字段作废）----
+  /// ① 行级促销优惠（限时折扣 / 满折）：天然归属本行，无需分摊
+  promoDiscount      BigInt @default(0) @map("promo_discount")
+  /// ② 订单级优惠分摊额（订单级满减 + 优惠券），按行金额权重分摊，尾差计入权重最大行
+  ///    ⚠️ 分摊结果固化在下单时，退款只读不算（CPN-13）
+  allocatedDiscount  BigInt @default(0) @map("allocated_discount")
+  /// [v2 新增] 命中的行级促销活动（冗余，便于复盘）
+  promotionId        BigInt? @map("promotion_id")
+
+  /// 本行实付（分）= goodsAmount - promoDiscount - allocatedDiscount（**不含运费**）
+  /// ⚠️ 运费不参与行分摊：Σ payableAmount + freightAmount == orders.payAmount
+  payableAmount  BigInt   @map("payable_amount")
+  /// 已退数量与金额（部分退款校验用）
+  refundedQuantity Int    @default(0) @map("refunded_quantity")
+  refundedAmount   BigInt @default(0) @map("refunded_amount")
+  createdAt      DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  order       Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  sku         Sku          @relation(fields: [skuId], references: [id])
+  refundItems RefundItem[]
+  /// [v2 新增]
+  promotion   Promotion?  @relation(fields: [promotionId], references: [id])
+
+  @@index([orderId])
+  @@index([skuId, createdAt])
+  @@map("order_items")
+}
+
+/// 订单状态变更轨迹（只增不改不删）
+model OrderStatusLog {
+  id           BigInt       @id @default(autoincrement())
+  orderId      BigInt       @map("order_id")
+  orderNo      String       @map("order_no") @db.VarChar(32)
+  /// 创建订单时 fromStatus 为 NULL
+  fromStatus   OrderStatus? @map("from_status")
+  toStatus     OrderStatus  @map("to_status")
+  operatorType OperatorType @map("operator_type")
+  /// SYSTEM 时填 0
+  operatorId   BigInt       @map("operator_id")
+  operatorName String?      @map("operator_name") @db.VarChar(64)
+  /// 变更原因（取消原因、退款原因、超时等）
+  reason       String?      @db.VarChar(255)
+  remark       String?      @db.VarChar(500)
+  /// 附加信息 JSON，如 {"paymentNo":"PAY...","refundNo":"SR...","logisticsNo":"SF..."}
+  extra        Json?        @db.Json
+  createdAt    DateTime     @default(now()) @map("created_at") @db.DateTime(3)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, createdAt])
+  @@index([orderNo])
+  @@index([toStatus, createdAt])
+  @@map("order_status_logs")
+}
+
+// ============================================================================
+// 支付域
+// ============================================================================
+
+/// 支付单
+/// [v2 变更] ① **一张表同时承载「订单支付」与「余额充值」**（`biz_type` 区分）；
+///          ② 订单支付场景下 **1 笔订单 = 1 个有效支付单**（v1.1 取消混合支付，
+///             不存在父子支付单结构，允许多次「尝试」但成功者唯一）；
+///          ③ 新增子支付方式 / 费率 / 回调处理状态 / mock 标记。
+model Payment {
+  id             BigInt     @id @default(autoincrement())
+  paymentNo      String     @unique @map("payment_no") @db.VarChar(32)
+  /// [v2 变更] 订单支付时必填；**余额充值时为 NULL**（改为关联 recharge_orders）
+  orderId        BigInt?    @map("order_id")
+  /// 冗余订单号，便于对账检索（充值场景为 NULL）
+  orderNo        String?    @map("order_no") @db.VarChar(32)
+  userId         BigInt     @map("user_id")
+  /// [v2 新增] 业务类型：ORDER 订单支付 / RECHARGE 余额充值
+  bizType        PaymentBizType @default(ORDER) @map("biz_type")
+  /// [v2 新增] 业务单号：ORDER → orders.order_no；RECHARGE → recharge_orders.recharge_no
+  bizNo          String     @map("biz_no") @db.VarChar(32)
+  /// [v2 新增] 充值单 ID（bizType=RECHARGE 时必填）
+  rechargeId     BigInt?    @map("recharge_id")
+  channel        PayChannel @default(MOCK)
+  /// [v2 新增] 子支付方式（WEB/SCAN/JSAPI/H5/GATEWAY/QUICK/BALANCE）
+  subChannel     SubChannel? @map("sub_channel")
+  /// 支付金额（分）
+  amount         BigInt
+  status         PayStatus  @default(PENDING)
+  /// 渠道交易号（支付宝 trade_no / 微信 transaction_id）
+  channelTradeNo String?    @map("channel_trade_no") @db.VarChar(64)
+  /// 支付页地址（mock 为前端 /payment/:paymentNo；真实为渠道 payUrl）
+  payUrl         String?    @map("pay_url") @db.VarChar(512)
+  qrCodeUrl      String?    @map("qrcode_url") @db.VarChar(512)
+  expireAt       DateTime?  @map("expire_at") @db.DateTime(3)
+  paidAt         DateTime?  @map("paid_at") @db.DateTime(3)
+  closedAt       DateTime?  @map("closed_at") @db.DateTime(3)
+  /// 回调次数（幂等观察用）
+  notifyCount    Int        @default(0) @map("notify_count")
+  lastNotifyAt   DateTime?  @map("last_notify_at") @db.DateTime(3)
+  /// [v2 新增] 回调处理状态（回调接口只落日志 + 投递队列，由 Worker 推进）
+  notifyStatus   PaymentNotifyStatus? @map("notify_status")
+  /// 回调原始数据（脱敏后），排查必备
+  rawNotify      Json?      @map("raw_notify") @db.Json
+  /// [v2 新增] 发起支付的渠道原始响应（脱敏），排查「下单成功但没拉起支付」必备
+  rawRequest     Json?      @map("raw_request") @db.Json
+  /// 渠道手续费（分），由 feeRate 计算，与渠道账单核对（允许 ±1 分舍入差异并记录）
+  feeAmount      BigInt     @default(0) @map("fee_amount")
+  /// [v2 新增] 下单时快照的渠道费率（万分比），防后台改配置导致历史对账漂移
+  feeRate        Int        @default(0) @map("fee_rate")
+  /// [v2 新增] mock 渠道标记：生产开启 mock 会产生「有订单无真实资金」的账，对账须剔除
+  isMock         Boolean    @default(false) @map("is_mock")
+  failReason     String?    @map("fail_reason") @db.VarChar(255)
+  idempotencyKey String?    @map("idempotency_key") @db.VarChar(128)
+  createdAt      DateTime   @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt      DateTime   @updatedAt @map("updated_at") @db.DateTime(3)
+
+  user         User           @relation(fields: [userId], references: [id])
+  order        Order?         @relation(fields: [orderId], references: [id])
+  rechargeOrder RechargeOrder? @relation(fields: [rechargeId], references: [id])
+
+  @@index([orderId, status])
+  @@index([orderNo])
+  @@index([status, createdAt])
+  @@index([channelTradeNo])
+  /// [v2 新增] 充值单反查支付单；按业务类型 + 单号检索
+  @@index([bizType, bizNo])
+  @@index([rechargeId])
+  /// [v2 新增] 对账：按渠道 + 状态扫待关单 / 待查单
+  @@index([channel, status, createdAt])
+  @@map("payments")
+}
+
+/// [v2 新增] 支付方式（后台可配置：开关 / 展示名 / 图标 / 排序 / 限额 / 费率 / 适用终端）
+/// PAYC-05。收银台按 payment_methods 动态渲染，改配置无需发版。
+model PaymentMethod {
+  id          BigInt   @id @default(autoincrement())
+  /// 唯一编码，如 `alipay_scan` / `wechat_jsapi` / `bankcard_gateway` / `balance`
+  code        String   @unique @db.VarChar(32)
+  channel     PayChannel
+  subChannel  SubChannel? @map("sub_channel")
+  /// 展示名称，如「支付宝扫码支付」
+  name        String   @db.VarChar(64)
+  icon        String?  @db.VarChar(512)
+  enabled     Boolean  @default(false)
+  status      PaymentMethodStatus @default(NORMAL)
+  /// 收银台排序（升序）
+  sort        Int      @default(100)
+  /// 适用终端 JSON 数组，如 ["PC","H5","WECHAT_IN"]
+  terminals   Json     @db.Json
+  /// 单笔限额（分）；0 表示不限
+  minAmount   BigInt   @default(1) @map("min_amount")
+  maxAmount   BigInt   @default(0) @map("max_amount")
+  /// 渠道费率（万分比整数），如 60 = 0.6%；仅用于成本估算，实际以渠道账单为准
+  feeRate     Int      @default(0) @map("fee_rate")
+  /// 渠道私有配置 JSON（聚合商标识、支持银行列表等），脱敏后落库
+  config      Json?    @db.Json
+  /// 维护中展示的提示文案
+  maintainTip String?  @map("maintain_tip") @db.VarChar(255)
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  @@index([channel, enabled, sort])
+  @@map("payment_methods")
+}
+
+/// [v2 新增] 余额充值单（BAL-02 / BAL-17）。单号 `RC` 前缀。
+/// ⚠️ 充值**不属于商品交易**，不参与优惠计算；**不允许用余额支付充值**（余额充余额会绕过充值限额）。
+model RechargeOrder {
+  id          BigInt          @id @default(autoincrement())
+  rechargeNo  String          @unique @map("recharge_no") @db.VarChar(32)
+  userId      BigInt          @map("user_id")
+  /// 充值本金（分）
+  amount      BigInt
+  /// 赠送金额（分），P1（BAL-05）；一期建字段，无赠送时恒 0
+  giftAmount  BigInt          @default(0) @map("gift_amount")
+  /// 实付金额（分）= amount（渠道侧收款口径，赠送部分不由用户支付）
+  payAmount   BigInt          @map("pay_amount")
+  status      RechargeStatus  @default(PENDING)
+  channel     PayChannel?
+  /// 成功入账的支付单号（用于反查与幂等）
+  paymentNo   String?         @map("payment_no") @db.VarChar(32)
+  /// 支付超时时间 = createdAt + order.payTimeoutMinutes（30 分钟，与订单关单一致）
+  expireAt    DateTime        @map("expire_at") @db.DateTime(3)
+  paidAt      DateTime?       @map("paid_at") @db.DateTime(3)
+  closedAt    DateTime?       @map("closed_at") @db.DateTime(3)
+  idempotencyKey String?      @map("idempotency_key") @db.VarChar(128)
+  createdAt   DateTime        @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime        @updatedAt @map("updated_at") @db.DateTime(3)
+
+  user     User      @relation(fields: [userId], references: [id])
+  payments Payment[]
+
+  @@index([userId, status, createdAt])
+  @@index([status, expireAt])
+  @@map("recharge_orders")
+}
+
+/// 退款单
+model Refund {
+  id              BigInt       @id @default(autoincrement())
+  refundNo        String       @unique @map("refund_no") @db.VarChar(32)
+  orderId         BigInt       @map("order_id")
+  orderNo         String       @map("order_no") @db.VarChar(32)
+  paymentNo       String?      @map("payment_no") @db.VarChar(32)
+  userId          BigInt       @map("user_id")
+  type            RefundType   @default(FULL)
+  /// 退款金额（分），≤ (payAmount - 已退金额)
+  amount          BigInt
+  /// [v2 变更] **退款去向（单一来源，唯一规则）**：
+  ///   BALANCE = 退回用户余额账户（本地事务，即时到账）
+  ///   CHANNEL = 原路退回原渠道（调渠道 refund）
+  /// ⚠️ v1.1 取消混合支付后不存在「按余额段/渠道段拆分」，一笔退款只有一个去向，
+  ///    因此**不需要 refund_segments 多段明细表**（该设计已删除）。
+  refundTo        RefundTarget @default(CHANNEL) @map("refund_to")
+  /// [v2 新增] 本次退还的运费（分）。仅整单退款退运费；部分退款默认 0（可配）
+  freightRefundAmount BigInt   @default(0) @map("freight_refund_amount")
+  /// [v2 新增] 本次退还的已分摊优惠合计（分）= Σ refund_items.allocated_discount_refund
+  ///   用于核销「优惠退回」口径，不产生现金流
+  discountRefundAmount BigInt  @default(0) @map("discount_refund_amount")
+  /// [v2 新增] 是否返还优惠券（整单退款=true；部分退款恒 false，CPN-14）
+  restoreCoupon   Boolean      @default(false) @map("restore_coupon")
+  /// [v2 新增] 返还的券 ID（restoreCoupon=true 时必填）
+  restoredCouponId BigInt?     @map("restored_coupon_id")
+  /// [v2 新增] 渠道退款手续费损失（分）：渠道退款一般不退还已扣手续费，财务核算用
+  feeLossAmount   BigInt       @default(0) @map("fee_loss_amount")
+  status          RefundStatus @default(PENDING)
+  /// 退款原因码（字典在代码常量中维护）
+  reasonCode      String?      @map("reason_code") @db.VarChar(32)
+  reasonText      String?      @map("reason_text") @db.VarChar(500)
+  /// 凭证图片 URL 数组
+  voucherImages   Json?        @map("voucher_images") @db.Json
+  channelRefundNo String?      @map("channel_refund_no") @db.VarChar(64)
+  /// 审核信息（PRD Q5：已发货/已完成需人工审核）
+  auditBy         BigInt?      @map("audit_by")
+  auditAt         DateTime?    @map("audit_at") @db.DateTime(3)
+  auditRemark     String?      @map("audit_remark") @db.VarChar(500)
+  rejectedReason  String?      @map("rejected_reason") @db.VarChar(500)
+  refundedAt      DateTime?    @map("refunded_at") @db.DateTime(3)
+  failReason      String?      @map("fail_reason") @db.VarChar(500)
+  /// 重试次数，配合 nextRetryAt 做指数退避
+  retryCount      Int          @default(0) @map("retry_count")
+  nextRetryAt     DateTime?    @map("next_retry_at") @db.DateTime(3)
+  idempotencyKey  String?      @map("idempotency_key") @db.VarChar(128)
+  createdAt       DateTime     @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime     @updatedAt @map("updated_at") @db.DateTime(3)
+
+  user  User         @relation(fields: [userId], references: [id])
+  order Order        @relation(fields: [orderId], references: [id])
+  items RefundItem[]
+  /// [v2 新增]
+  restoredCoupon Coupon? @relation(fields: [restoredCouponId], references: [id])
+
+  @@index([orderId, status])
+  @@index([orderNo])
+  @@index([status, nextRetryAt])
+  @@index([userId, createdAt])
+  /// [v2 新增] 对账：按退款去向分组汇总（余额退款 vs 渠道退款分开核算）
+  @@index([refundTo, status, createdAt])
+  @@map("refunds")
+}
+
+/// 退款行明细
+/// [v2 变更] **部分退款由 P1 上调为 P0**（05-PRD-变更 §9.2）：一单多件只退一件是高频售后场景。
+/// 全额退款也写行，便于对账。每行记录本次退还的「实付」与「已分摊优惠」两个口径。
+model RefundItem {
+  id          BigInt   @id @default(autoincrement())
+  refundId    BigInt   @map("refund_id")
+  orderItemId BigInt   @map("order_item_id")
+  skuId       BigInt   @map("sku_id")
+  /// 本次退款数量（≤ order_items.quantity - refunded_quantity）
+  quantity    Int
+  /// 该行本次退款金额（分）= 按比例折算的行实付，向下取整
+  ///   行实付 = goodsAmount - promoDiscount - allocatedDiscount
+  amount      BigInt
+  /// [v2 新增] 本次退还的**行级促销优惠**（分），按比例折算，向下取整
+  promoDiscountRefund     BigInt @default(0) @map("promo_discount_refund")
+  /// [v2 新增] 本次退还的**行分摊优惠**（分），按比例折算，向下取整
+  ///   ⚠️ 尾差归入最后一行，保证「Σ 行退款 + 尾差 == 退款单 amount」，不丢不重
+  allocatedDiscountRefund BigInt @default(0) @map("allocated_discount_refund")
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  refund    Refund    @relation(fields: [refundId], references: [id], onDelete: Cascade)
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id])
+  sku       Sku       @relation(fields: [skuId], references: [id])
+
+  @@index([refundId])
+  @@index([orderItemId])
+  @@map("refund_items")
+}
+
+// ============================================================================
+// 资金域（核心 · 客户点名）
+// ============================================================================
+
+/// 资金账户
+/// [v2 变更] 由「一期仅 1 条平台现金账户」升级为**双账户体系**：
+///   · PLATFORM_CASH —— 全局 1 条，账户余额 = 平台实际持有的现金（含代管的用户余额）
+///   · USER_BALANCE  —— **每用户 1 条**，账户余额 = 平台对该用户的负债
+/// ⚠️ 关键语义：USER_BALANCE 账户的「余额」对平台而言是**负债不是收入**。
+///    用户充值时钱确实进了平台银行账户，但它是用户的钱（用户可消费），
+///    只有被消费时才结转为主营业务收入 —— 这个结转靠「结转对」流水完成，详见 §3.6.4。
+model FundAccount {
+  id           BigInt           @id @default(autoincrement())
+  accountNo    String           @unique @map("account_no") @db.VarChar(32)
+  accountType  FundAccountType  @default(PLATFORM_CASH) @map("account_type")
+  /// [v2 新增] 归属用户。PLATFORM_CASH 恒 NULL；USER_BALANCE 必填且唯一（见 uk_user_account）
+  userId       BigInt?          @map("user_id")
+  name         String           @db.VarChar(64)
+  currency     String           @default("CNY") @db.Char(3)
+  /// 当前余额（分）= Σ(IN) - Σ(OUT)。**受 CHECK(balance >= 0) 保护，永不透支**
+  balance      BigInt           @default(0)
+  /// [v2 变更] 冻结余额（分）。由「二阶段预留」变为**实际可用**：
+  ///   一期余额支付场景恒 0（待支付订单不冻结余额，见 05-PRD-变更 §5.3.2）；
+  ///   风控/争议冻结、二期提现冻结、预售定金用它。可用余额 = balance - frozenBalance
+  frozenBalance BigInt          @default(0) @map("frozen_balance")
+  totalIn      BigInt           @default(0) @map("total_in")
+  totalOut     BigInt           @default(0) @map("total_out")
+  /// 乐观锁，配合 FOR UPDATE 使用
+  version      Int              @default(0)
+  status       AccountStatus    @default(ACTIVE)
+  createdAt    DateTime         @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt    DateTime         @updatedAt @map("updated_at") @db.DateTime(3)
+
+  transactionsOut FundTransaction[] @relation("FundTxAccount")
+  transactionsIn  FundTransaction[] @relation("FundTxCounterparty")
+  user            User?            @relation(fields: [userId], references: [id])
+
+  /// [v2 新增] 每用户每类型最多一个账户。MySQL 唯一索引允许多个 NULL，
+  /// 故 PLATFORM_CASH（userId=NULL）可有多条，USER_BALANCE（userId 非空）天然唯一
+  @@unique([userId, accountType], map: "uk_user_account")
+  @@index([accountType, status])
+  @@map("fund_accounts")
+}
+
+/// 资金流水（只增、不改、不删；更正只能写 REVERSAL 冲正流水）
+/// ⚠️ 本表不提供 update / delete 的 Repository 方法
+///
+/// [v2 变更] 采用 **方案 A+：单式流水 + 对手方 + 交易组号**（论证见 §3.6.4）：
+///   · 每条流水仍只记**一个账户**的增减（单式，不改表的基本语义）
+///   · `counterparty_account_id` 记对手账户，回答「钱从哪来、到哪去」
+///   · `tx_group_no` 把同一笔业务的多条流水绑成一组（负债结转对强依赖它）
+///   · `is_liability` 标记该笔流水属于「负债口径」还是「收入口径」，
+///     **平台负债/收入是派生量**，由对账任务校验（§4.5 + 04-flows F11），不建独立账户
+model FundTransaction {
+  id           BigInt          @id @default(autoincrement())
+  /// 流水号：FT + yyyyMMdd + 8 位序列
+  txNo         String          @unique @map("tx_no") @db.VarChar(40)
+  accountId    BigInt          @map("account_id")
+  /// 冗余账户号与类型，便于按账户检索与二阶段扩展
+  accountNo    String          @map("account_no") @db.VarChar(32)
+  accountType  FundAccountType @map("account_type")
+  /// [v2 新增] 对手方账户（资金流向的另一端）。PLATFORM 与 USER_BALANCE 互指。
+  /// 单向转账（如 CHANNEL_FEE 手续费给渠道）时可为 NULL
+  counterpartyAccountId BigInt? @map("counterparty_account_id")
+  counterpartyAccountNo String? @map("counterparty_account_no") @db.VarChar(32)
+  /// [v2 新增] 交易组号：同一笔业务产生的多条流水共享，是「负债结转对」的绑定键
+  txGroupNo    String?         @map("tx_group_no") @db.VarChar(40)
+  bizType      FundBizType     @map("biz_type")
+  /// IN = 入账（账户增加），OUT = 出账（账户减少）
+  direction    FundDirection
+  /// 金额（分），恒为正数，方向由 direction 表达
+  amount       BigInt
+  currency     String          @default("CNY") @db.Char(3)
+  /// [v2 新增] 该笔流水是否计入「平台负债」口径。
+  ///   true  = 这笔钱属于用户（充值收款、负债结转的冲减侧）
+  ///   false = 这笔钱属于平台（订单收入、手续费、结转的收入侧）
+  /// ⚠️ 只有 accountType = PLATFORM_CASH 的流水需要区分；USER_BALANCE 流水恒 false
+  isLiability  Boolean         @default(false) @map("is_liability")
+  /// 变动前余额快照（分）
+  beforeBalance BigInt         @map("before_balance")
+  /// 变动后余额快照（分）
+  afterBalance  BigInt         @map("after_balance")
+
+  // ---- 关联单号（对账还原的关键）----
+  orderNo      String?         @map("order_no") @db.VarChar(32)
+  paymentNo    String?         @map("payment_no") @db.VarChar(32)
+  refundNo     String?         @map("refund_no") @db.VarChar(32)
+  /// [v2 新增] 关联充值单号（充值相关流水必填）
+  rechargeNo   String?         @map("recharge_no") @db.VarChar(32)
+  /// 关联原流水号（冲正时必填）
+  relatedTxNo  String?         @map("related_tx_no") @db.VarChar(40)
+  /// 其它业务单号（手工单号等）
+  bizNo        String?         @map("biz_no") @db.VarChar(64)
+
+  // ---- 操作人 ----
+  operatorType OperatorType    @map("operator_type")
+  /// SYSTEM 时填 0
+  operatorId   BigInt          @map("operator_id")
+  operatorName String?         @map("operator_name") @db.VarChar(64)
+
+  idempotencyKey String?       @map("idempotency_key") @db.VarChar(128)
+  remark       String?         @db.VarChar(500)
+  extra        Json?           @db.Json
+  createdAt    DateTime        @default(now()) @map("created_at") @db.DateTime(3)
+
+  account      FundAccount  @relation("FundTxAccount", fields: [accountId], references: [id])
+  counterparty FundAccount? @relation("FundTxCounterparty", fields: [counterpartyAccountId], references: [id])
+
+  @@unique([bizType, idempotencyKey], map: "uk_biz_idem")
+  @@index([orderNo, createdAt])
+  @@index([bizType, createdAt])
+  @@index([accountId, createdAt])
+  @@index([direction, createdAt])
+  @@index([paymentNo])
+  @@index([refundNo])
+  @@index([operatorType, operatorId, createdAt])
+  /// [v2 新增] 按交易组号还原「一笔业务的全部流水」（结转对校验、F11 对账核心索引）
+  @@index([txGroupNo])
+  /// [v2 新增] 负债口径汇总：Σ(is_liability=true) - Σ(is_liability=false) 分层统计
+  @@index([accountType, isLiability, createdAt])
+  /// [v2 新增] 充值相关流水反查
+  @@index([rechargeNo])
+  /// [v2 新增] 按对手方账户还原跨账户资金流向
+  @@index([counterpartyAccountId, createdAt])
+  @@map("fund_transactions")
+}
+
+// ============================================================================
+// 幂等
+// ============================================================================
+
+/// 幂等记录表（唯一索引 (scope, idempotency_key) 保证抢占）
+model IdempotencyRecord {
+  id                 BigInt             @id @default(autoincrement())
+  /// 作用域，如 ORDER_CREATE:{userId}、PAY_CALLBACK、STOCK_ADJUST:{adminId}
+  scope              String             @db.VarChar(64)
+  idempotencyKey     String             @map("idempotency_key") @db.VarChar(128)
+  /// 请求体 sha256 指纹（规范化后计算），防同 Key 不同参
+  requestFingerprint String             @map("request_fingerprint") @db.VarChar(64)
+  /// 首次成功响应的完整快照（含 code/message/data），命中时原样返回
+  responseSnapshot   Json?              @map("response_snapshot") @db.Json
+  status             IdempotencyStatus  @default(PROCESSING)
+  expireAt           DateTime           @map("expire_at") @db.DateTime(3)
+  createdAt          DateTime           @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt          DateTime           @updatedAt @map("updated_at") @db.DateTime(3)
+
+  @@unique([scope, idempotencyKey], map: "uk_scope_key")
+  @@index([expireAt])
+  @@map("idempotency_records")
+}
+
+// ============================================================================
+// 后台管理
+// ============================================================================
+
+/// 后台管理员（与 C 端用户完全隔离，Token 作用域独立）
+model AdminUser {
+  id             BigInt      @id @default(autoincrement())
+  username       String      @unique @db.VarChar(64)
+  passwordHash   String      @map("password_hash") @db.VarChar(255)
+  realName       String?     @map("real_name") @db.VarChar(64)
+  phone          String?     @db.VarChar(20)
+  /// [v2 变更] `role` 枚举列 **已移除**，改为多对多关联 `roles`（见 §3.10）
+  status         AdminStatus @default(ACTIVE)
+  /// [v2 新增] token 版本号：+1 即让该管理员所有已签发 access token 失效。
+  /// 用途：权限变更后强制重登录、账号禁用即时下线（RBAC-12）
+  tokenVersion   Int         @default(1) @map("token_version")
+  lastLoginAt    DateTime?   @map("last_login_at") @db.DateTime(3)
+  lastLoginIp    String?     @map("last_login_ip") @db.VarChar(64)
+  loginFailCount Int         @default(0) @map("login_fail_count")
+  lockedUntil    DateTime?   @map("locked_until") @db.DateTime(3)
+  /// [v2 新增] 内置超级管理员标记：不可删除、不可解绑 SUPER_ADMIN 角色（RBAC-03）
+  isBuiltin      Boolean     @default(false) @map("is_builtin")
+  createdAt      DateTime    @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt      DateTime    @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt      DateTime?   @map("deleted_at") @db.DateTime(3)
+
+  refreshTokens RefreshToken[]
+  /// [v2 新增] 多角色（RBAC-05）：权限点取并集，数据范围取最宽（RBAC-06）
+  adminRoles    AdminUserRole[]
+
+  @@index([status])
+  @@map("admin_users")
+}
+
+// ============================================================================
+// [v2 新增] RBAC 域（变更②：动态角色管理台，推翻 A8）
+// ============================================================================
+
+/// 角色。与 `admin_users` 多对多（`admin_user_roles`）。
+/// 内置角色 `SUPER_ADMIN`（不可删除、不可编辑权限）+ `ADMIN`（可编辑、不可删除），
+/// 均 `isBuiltin = true`（RBAC-03）。
+model Role {
+  id          BigInt      @id @default(autoincrement())
+  /// 角色编码（唯一，如 `SUPER_ADMIN` / `OPERATOR` / `FINANCE`），代码内引用
+  code        String      @unique @db.VarChar(64)
+  name        String      @db.VarChar(64)
+  description String?     @db.VarChar(255)
+  /// 数据权限范围（一期两档 ALL / SELF，RBAC-09）
+  dataScope   DataScope   @default(SELF) @map("data_scope")
+  status      RoleStatus  @default(ENABLED)
+  /// 内置角色：不可删除；SUPER_ADMIN 额外不可编辑权限、前端不显示删除/编辑按钮
+  isBuiltin   Boolean     @default(false) @map("is_builtin")
+  /// 排序（后台列表展示）
+  sort        Int         @default(100)
+  createdAt   DateTime    @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime    @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt   DateTime?   @map("deleted_at") @db.DateTime(3)
+
+  rolePermissions RolePermission[]
+  adminRoles      AdminUserRole[]
+
+  @@index([status, sort])
+  @@map("roles")
+}
+
+/// 权限点。编码规范 `资源:操作`（两段式为主，特殊场景三段式如 `order:refund:audit`）。
+/// 资源清单（一期）：product / category / sku / stock / order / refund / coupon / promo /
+///                  user / balance / fund / rbac:role / rbac:admin / pay:channel / log
+/// 操作枚举：list / detail / create / update / delete / export / audit / adjust / publish
+model Permission {
+  id           BigInt   @id @default(autoincrement())
+  /// 权限点编码（唯一），如 `product:create`
+  code         String   @unique @db.VarChar(64)
+  /// 模块分组（前端权限树按此分组，如 `product` / `order` / `rbac`）
+  module       String   @db.VarChar(32)
+  name         String   @db.VarChar(64)
+  description  String?  @db.VarChar(255)
+  /// 敏感权限：绕过 60s 权限缓存，**每次实时判定**（refund:audit / balance:adjust / rbac:*）
+  isSensitive  Boolean  @default(false) @map("is_sensitive")
+  sort         Int      @default(100)
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  rolePermissions RolePermission[]
+
+  @@index([module, sort])
+  @@map("permissions")
+}
+
+/// 角色 - 权限点关联（多对多）
+model RolePermission {
+  id           BigInt     @id @default(autoincrement())
+  roleId       BigInt     @map("role_id")
+  permissionId BigInt     @map("permission_id")
+  createdAt    DateTime   @default(now()) @map("created_at") @db.DateTime(3)
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId], map: "uk_role_perm")
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+/// 管理员 - 角色关联（多对多，RBAC-05）。同一角色不可重复分配。
+model AdminUserRole {
+  id           BigInt   @id @default(autoincrement())
+  adminUserId  BigInt   @map("admin_user_id")
+  roleId       BigInt   @map("role_id")
+  /// 分配人（审计用）
+  createdBy    BigInt?  @map("created_by")
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  role      Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([adminUserId, roleId], map: "uk_admin_role")
+  @@index([roleId])
+  @@map("admin_user_roles")
+}
+
+// ============================================================================
+// [v2 新增] 优惠券 / 促销域（变更①：一期实现，推翻 A2）
+// ============================================================================
+
+/// 券模板（运营侧定义，CPN-01 ~ CPN-03 / CPN-11）
+model CouponTemplate {
+  id          BigInt   @id @default(autoincrement())
+  templateNo  String   @unique @map("template_no") @db.VarChar(32)
+  name        String   @db.VarChar(128)
+  type        CouponType
+  /// 使用门槛（分）。NO_THRESHOLD 券强制为 0；门槛基于**促销后**商品金额判定（Q-B14）
+  thresholdAmount BigInt @default(0) @map("threshold_amount")
+  /// 满减/无门槛券面额（分）
+  discountAmount  BigInt? @map("discount_amount")
+  /// 折扣券折扣率（**万分比整数**，8500 = 85 折）
+  discountRate    Int?    @map("discount_rate")
+  /// 折扣券封顶金额（分），DISCOUNT 类型**必填**
+  maxDiscount     BigInt? @map("max_discount")
+
+  // ---- 有效期策略（两种互斥，CPN-11）----
+  validType   CouponValidType @default(FIXED_RANGE) @map("valid_type")
+  /// 券的使用有效期（FIXED_RANGE 必填）
+  validStart  DateTime? @map("valid_start") @db.DateTime(3)
+  validEnd    DateTime? @map("valid_end") @db.DateTime(3)
+  /// 领取后 N 天有效（AFTER_CLAIM 必填）
+  validDays   Int?      @map("valid_days")
+
+  // ---- 领取窗口（模板自身的可领取时间段）----
+  claimStartAt DateTime? @map("claim_start_at") @db.DateTime(3)
+  claimEndAt   DateTime? @map("claim_end_at") @db.DateTime(3)
+
+  // ---- 发放控制 ----
+  /// 发放总量；NULL 表示不限
+  totalCount   Int?     @map("total_count")
+  /// 已发放量（领取时 CAS +1，防超发）
+  issuedCount  Int      @default(0) @map("issued_count")
+  /// 已核销量（统计用，支付成功时 +1）
+  usedCount    Int      @default(0) @map("used_count")
+  /// 每人限领（1~10，默认 1，CPN-03）
+  perLimit     Int      @default(1) @map("per_limit")
+
+  // ---- 适用范围与叠加策略 ----
+  /// 适用范围主类型；明细在 coupon_template_scopes
+  scopeType    ScopeType @default(ALL) @map("scope_type")
+  /// 券只抵扣商品金额，不抵扣运费（默认关，CPN-12）
+  applyToFreight   Boolean @default(false) @map("apply_to_freight")
+  /// 是否可与促销叠加：true = 可叠加；false = 不与促销同享（CPN-10，默认可叠加）
+  stackableWithPromo Boolean @default(true) @map("stackable_with_promo")
+
+  status      CouponTemplateStatus @default(NOT_START)
+  createdBy   BigInt?  @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt   DateTime? @map("deleted_at") @db.DateTime(3)
+
+  scopes CouponTemplateScope[]
+  coupons Coupon[]
+  /// [T005 补齐] 设计文档 §2 未写这条反向关系，Prisma 校验要求关系必须成对，否则 P1012
+  orderCouponRecords OrderCouponRecord[]
+
+  @@index([status, claimStartAt, claimEndAt])
+  @@index([type, status])
+  @@map("coupon_templates")
+}
+
+/// 券模板适用范围明细（CPN-03）。scopeType=ALL 时无记录。
+model CouponTemplateScope {
+  id         BigInt    @id @default(autoincrement())
+  templateId BigInt    @map("template_id")
+  scopeType  ScopeType @map("scope_type")
+  /// 目标 ID：CATEGORY → categories.id；PRODUCT → products.id；EXCLUDE_PRODUCT → products.id
+  targetId   BigInt    @map("target_id")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  template CouponTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, scopeType, targetId], map: "uk_tpl_scope")
+  @@index([scopeType, targetId])
+  @@map("coupon_template_scopes")
+}
+
+/// 券实例（用户持有的券，CPN-04 ~ CPN-07）
+/// ⚠️ 状态流转必须与业务事务绑定，见 §7.1 事务 A/B/C/D/I
+model Coupon {
+  id         BigInt       @id @default(autoincrement())
+  couponNo   String       @unique @map("coupon_no") @db.VarChar(40)
+  templateId BigInt       @map("template_id")
+  userId     BigInt       @map("user_id")
+  status     CouponStatus @default(UNUSED)
+  /// 领取时间
+  claimedAt  DateTime     @map("claimed_at") @db.DateTime(3)
+  /// 过期时间（FIXED_RANGE 取模板 validEnd；AFTER_CLAIM 领取时算 claimedAt + validDays）
+  expireAt   DateTime     @map("expire_at") @db.DateTime(3)
+  /// 核销时间 / 核销订单号（USED 时必填）
+  usedAt     DateTime?    @map("used_at") @db.DateTime(3)
+  usedOrderNo String?     @map("used_order_no") @db.VarChar(32)
+  /// 占用时间 / 占用订单号（LOCKED 时必填，用于关单/回滚时精确解冻）
+  lockedAt   DateTime?    @map("locked_at") @db.DateTime(3)
+  lockedOrderNo String?   @map("locked_order_no") @db.VarChar(32)
+  /// 发放来源：CLAIM 领券中心 / SYSTEM 新客礼包 / ADMIN 后台定向发放
+  source     String       @default("CLAIM") @db.VarChar(24)
+  /// 发放批次号（定向发券幂等用，P1）
+  grantBatchNo String?    @map("grant_batch_no") @db.VarChar(40)
+  createdAt  DateTime     @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt  DateTime     @updatedAt @map("updated_at") @db.DateTime(3)
+
+  template    CouponTemplate       @relation(fields: [templateId], references: [id])
+  user        User                 @relation(fields: [userId], references: [id])
+  useLogs     CouponUseLog[]
+  orders      Order[]
+  orderRecords OrderCouponRecord[]
+  restoredBy  Refund[]
+
+  /// 「我的优惠券」按状态 Tab 筛选 + 有效期排序（CPN-07）
+  @@index([userId, status, expireAt])
+  /// 领券校验：限领计数、按模板统计核销率（CPN-19）
+  @@index([templateId, status])
+  /// 定时任务扫描过期券（CPN-11）
+  @@index([status, expireAt])
+  /// 关单/回滚时按订单号精确定位被锁定的券
+  @@index([lockedOrderNo])
+  @@map("coupons")
+}
+
+/// 券状态轨迹（只增不改不删）。CPN-04「非法流转拒绝并留日志」的落点。
+model CouponUseLog {
+  id         BigInt            @id @default(autoincrement())
+  couponId   BigInt            @map("coupon_id")
+  couponNo   String            @map("coupon_no") @db.VarChar(40)
+  fromStatus CouponStatus?     @map("from_status")
+  toStatus   CouponStatus      @map("to_status")
+  bizType    CouponLogBizType  @map("biz_type")
+  /// 关联订单号（LOCK / UNLOCK / USE / RESTORE 场景）
+  orderNo    String?           @map("order_no") @db.VarChar(32)
+  /// 关联退款单号（RESTORE 场景）
+  refundNo   String?           @map("refund_no") @db.VarChar(32)
+  operatorType OperatorType    @map("operator_type")
+  operatorId   BigInt          @map("operator_id")
+  remark     String?           @db.VarChar(500)
+  createdAt  DateTime          @default(now()) @map("created_at") @db.DateTime(3)
+
+  coupon Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [operatorId], references: [id])
+
+  @@index([couponId, createdAt])
+  @@index([bizType, createdAt])
+  @@map("coupon_use_logs")
+}
+
+/// 订单 - 券使用记录（1 单 1 券，CPN-09）。与订单同事务写入，退款返还时回写 restored_at。
+model OrderCouponRecord {
+  id         BigInt   @id @default(autoincrement())
+  orderNo    String   @unique @map("order_no") @db.VarChar(32)
+  /// [T005 补齐] 加 @unique 后才能与 Order.couponRecord 构成 1-1（CPN-09：1 单 1 券）。
+  /// 设计文档 §2 漏了它，Prisma 会报 P1012「one-to-one relation must use unique fields」
+  orderId    BigInt   @unique @map("order_id")
+  couponId   BigInt   @map("coupon_id")
+  templateId BigInt   @map("template_id")
+  userId     BigInt   @map("user_id")
+  /// 本单券优惠额（分），已分摊到行
+  discountAmount BigInt @map("discount_amount")
+  /// 券快照（面额/门槛/类型/名称），券模板事后被改不影响历史订单复盘
+  snapshot   Json     @db.Json
+  /// 返还时间 / 返还退款单号（整单退款才返还，CPN-14）
+  restoredAt DateTime? @map("restored_at") @db.DateTime(3)
+  restoredRefundNo String? @map("restored_refund_no") @db.VarChar(32)
+  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  order    Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  coupon   Coupon          @relation(fields: [couponId], references: [id])
+  template CouponTemplate  @relation(fields: [templateId], references: [id])
+  user     User            @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([templateId, createdAt])
+  @@map("order_coupon_records")
+}
+
+/// 促销活动（CPN-15 ~ CPN-17）
+model Promotion {
+  id          BigInt          @id @default(autoincrement())
+  promoNo     String          @unique @map("promo_no") @db.VarChar(32)
+  name        String          @db.VarChar(128)
+  type        PromotionType
+  /// 作用层级：ORDER（满减，需分摊到行）/ ROW（满折、限时折扣，天然归行）
+  level       PromotionLevel
+  status      PromotionStatus @default(DRAFT)
+  startAt     DateTime        @map("start_at") @db.DateTime(3)
+  endAt       DateTime        @map("end_at") @db.DateTime(3)
+  /// 优先级：同一商品命中多个活动时的排序（数值小者优先；同类型互斥时取优惠力度最大）
+  priority    Int             @default(100)
+  /// 是否可与优惠券叠加（false = 券模板勾选「不与促销同享」时该组合不可用）
+  stackable   Boolean         @default(true)
+  /// 每单限购数量（0 = 不限）
+  perOrderLimit Int           @default(0) @map("per_order_limit")
+  /// 适用范围主类型；明细在 promotion_scopes
+  scopeType   ScopeType       @default(ALL) @map("scope_type")
+  createdBy   BigInt?         @map("created_by")
+  createdAt   DateTime        @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime        @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt   DateTime?       @map("deleted_at") @db.DateTime(3)
+
+  rules  PromotionRule[]
+  scopes PromotionScope[]
+  orders Order[]
+  orderItems OrderItem[]
+
+  @@index([status, startAt, endAt])
+  @@index([type, level, status])
+  @@map("promotions")
+}
+
+/// 促销活动规则（阶梯满减用多行，取最高命中档）
+model PromotionRule {
+  id          BigInt   @id @default(autoincrement())
+  promotionId BigInt   @map("promotion_id")
+  /// 门槛金额（分）；0 表示不看金额门槛
+  thresholdAmount BigInt @default(0) @map("threshold_amount")
+  /// 门槛件数；0 表示不看件数门槛
+  thresholdQuantity Int  @default(0) @map("threshold_quantity")
+  /// 满减免额（分），FULL_REDUCE 用
+  discountAmount BigInt? @map("discount_amount")
+  /// 折扣率（万分比整数），FULL_DISCOUNT / FLASH_SALE 用（8500 = 85 折）
+  discountRate   Int?    @map("discount_rate")
+  /// 限时折扣固定价（分），FLASH_SALE 用（与 discountRate 二选一）
+  fixedPrice     BigInt? @map("fixed_price")
+  /// 折扣优惠封顶（分），FULL_DISCOUNT / FLASH_SALE 可选
+  maxDiscount    BigInt? @map("max_discount")
+  sort           Int     @default(0)
+  createdAt      DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  promotion Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+
+  @@index([promotionId, sort])
+  @@map("promotion_rules")
+}
+
+/// 促销活动适用范围明细
+model PromotionScope {
+  id          BigInt    @id @default(autoincrement())
+  promotionId BigInt    @map("promotion_id")
+  scopeType   ScopeType @map("scope_type")
+  /// 目标 ID：CATEGORY → categories.id；PRODUCT → products.id
+  targetId    BigInt    @map("target_id")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  promotion Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+
+  @@unique([promotionId, scopeType, targetId], map: "uk_promo_scope")
+  @@index([scopeType, targetId])
+  @@map("promotion_scopes")
+}
+
+/// 后台操作日志（审计留痕，关键操作 100% 记录，不可删改）
+/// [v2 新增] 权限变更审计（RBAC-10）**复用本表**：`module='rbac'`，
+/// `action` ∈ {role.create, role.update, role.delete, role.assign, role.revoke, role.toggle}，
+/// `before_value` / `after_value` 存**权限点数组差异**，按操作人 / 目标角色两个维度可查。
+model OperationLog {
+  id          BigInt   @id @default(autoincrement())
+  adminId     BigInt   @map("admin_id")
+  adminName   String?  @map("admin_name") @db.VarChar(64)
+  /// 模块：goods / order / stock / user / fund / system
+  module      String   @db.VarChar(32)
+  /// 动作：create / update / delete / ship / audit / adjust
+  action      String   @db.VarChar(64)
+  targetType  String?  @map("target_type") @db.VarChar(64)
+  targetId    String?  @map("target_id") @db.VarChar(64)
+  /// 变更前值（脱敏后 JSON）
+  beforeValue Json?    @map("before_value") @db.Json
+  afterValue  Json?    @map("after_value") @db.Json
+  ip          String?  @db.VarChar(64)
+  userAgent   String?  @map("user_agent") @db.VarChar(512)
+  result      OpResult @default(SUCCESS)
+  failReason  String?  @map("fail_reason") @db.VarChar(500)
+  requestId   String?  @map("request_id") @db.VarChar(64)
+  durationMs  Int?     @map("duration_ms")
+  /// 是否敏感操作（手工调账、批量上下架等，需二次确认）
+  sensitive   Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([adminId, createdAt])
+  @@index([targetType, targetId])
+  @@index([module, createdAt])
+  @@index([sensitive, createdAt])
+  @@map("operation_logs")
+}
+
+// ============================================================================
+// 文件与第三方调用记录
+// ============================================================================
+
+/// 上传文件记录
+model UploadFile {
+  id           BigInt        @id @default(autoincrement())
+  /// 存储相对路径，如 product/20240102/xxx.png
+  fileKey      String        @unique @map("file_key") @db.VarChar(255)
+  originalName String        @map("original_name") @db.VarChar(255)
+  mimeType     String        @map("mime_type") @db.VarChar(100)
+  /// 文件大小（字节）
+  size         Int
+  storage      StorageType   @default(LOCAL)
+  url          String        @db.VarChar(512)
+  /// 业务类型：product / avatar / voucher / category
+  bizType      String?       @map("biz_type") @db.VarChar(32)
+  checksum     String?       @db.VarChar(64)
+  uploaderType OperatorType  @map("uploader_type")
+  uploaderId   BigInt        @map("uploader_id")
+  createdAt    DateTime      @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([uploaderType, uploaderId, createdAt])
+  @@index([bizType, createdAt])
+  @@map("upload_files")
+}
+
+/// 第三方适配器调用记录（P1，请求/响应脱敏存储）
+model IntegrationCallLog {
+  id             BigInt      @id @default(autoincrement())
+  adapterType    AdapterType @map("adapter_type")
+  /// mock / alipay / wechat / kuaidi100 / aliyun ...
+  provider       String      @db.VarChar(32)
+  /// createPayment / queryTrace / sendVerifyCode ...
+  action         String      @db.VarChar(64)
+  requestId      String?     @map("request_id") @db.VarChar(64)
+  /// 关联业务单号（支付单号/订单号/运单号）
+  bizNo          String?     @map("biz_no") @db.VarChar(64)
+  requestPayload Json?       @map("request_payload") @db.Json
+  responsePayload Json?      @map("response_payload") @db.Json
+  success        Boolean
+  /// 适配器返回码
+  code           String?     @db.VarChar(32)
+  message        String?     @db.VarChar(500)
+  durationMs     Int         @map("duration_ms")
+  retryCount     Int         @default(0) @map("retry_count")
+  createdAt      DateTime    @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([adapterType, createdAt])
+  @@index([bizNo])
+  @@index([success, createdAt])
+  @@map("integration_call_logs")
+}
