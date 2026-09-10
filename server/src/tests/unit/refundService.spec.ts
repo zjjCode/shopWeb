@@ -602,6 +602,15 @@ describe('退款领域层 RefundService（T080-A）', () => {
     for (const call of stockService.refundReturn.mock.calls) {
       expect(call[1]).toBe(TX);
     }
+
+    // 记账同样必须拿到 tx：credit 两次 + debit 一次，逐个钉死第二参
+    // （漏传 → 记账跑独立连接，事务 C 回滚时退款流水已经落库 = 钱凭空退了两次）
+    expect(fundService.credit.mock.calls).toHaveLength(2);
+    expect(fundService.debit.mock.calls).toHaveLength(1);
+    for (const call of fundService.credit.mock.calls) {
+      expect(call[1]).toBe(TX);
+    }
+    expect(fundService.debit.mock.calls[0]?.[1]).toBe(TX);
     // 按 sku_id 升序串行（防多订单并发死锁，F5.3）
     const skuSeq = stockService.refundReturn.mock.calls.map(
       (c) => (c[0] as { skuId: bigint }).skuId,
@@ -657,6 +666,44 @@ describe('退款领域层 RefundService（T080-A）', () => {
     };
     expect(arg.where).toEqual({ orderId: 9001n, status: 'SUCCESS' });
     expect(arg.data.status).toBe('REFUNDED');
+  });
+
+  it('⚠️ 记账事务红线：三条流水的 credit / debit 第二参逐个必须等于事务 C 的 tx', async () => {
+    await svc.execute(REFUND_NO);
+
+    // 顺序：① 余额 IN ② 反向结转 IN（都是 credit）③ 反向结转 OUT（debit）
+    expect(fundService.credit).toHaveBeenCalledTimes(2);
+    expect(fundService.debit).toHaveBeenCalledTimes(1);
+
+    expect(fundService.credit.mock.calls[0]?.[1]).toBe(TX);
+    expect(fundService.credit.mock.calls[1]?.[1]).toBe(TX);
+    expect(fundService.debit.mock.calls[0]?.[1]).toBe(TX);
+
+    // 三笔的 bizType 与位置一一对应，防止「顺序变了但 tx 断言仍通过」
+    expect(threePosts().map((p) => p.bizType)).toEqual([
+      'BALANCE_REFUND',
+      'LIABILITY_SETTLE_IN',
+      'LIABILITY_SETTLE_OUT',
+    ]);
+  });
+
+  it('⚠️ 退款单推进是条件更新：execute 的 updateMany.where 必须带 status=PROCESSING', async () => {
+    await svc.execute(REFUND_NO);
+
+    // 只断言「被调用过」或只 mock count=0 都不够 —— 必须证明 where 里真的写了状态条件，
+    // 否则「重复执行二次退款」的闸门形同虚设
+    expect(TX.refund.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { refundNo: REFUND_NO, status: RefundStatus.PROCESSING },
+      data: { status: RefundStatus.SUCCESS },
+    });
+  });
+
+  it('⚠️ 审核是条件更新：audit 的 updateMany.where 必须带 status=PENDING（防重复审核）', async () => {
+    await svc.audit(99n, REFUND_NO, true, '同意退款');
+
+    expect(TX.refund.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { refundNo: REFUND_NO, status: RefundStatus.PENDING },
+    });
   });
 
   // ==========================================================================
