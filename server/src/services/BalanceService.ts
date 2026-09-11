@@ -156,6 +156,20 @@ export class BalanceService {
   /**
    * 充值入账（调 FundService.credit，带幂等键，余额不足/冻结由下层或本层拦截）。
    *
+   * @deprecated ⚠️ **不可用于充值主路径**（QA 定级 P1，2026-09-10）。
+   *
+   * 本方法**只记用户侧单条流水**（`BALANCE_RECHARGE`），
+   * **不记平台侧负债流水**（`PLATFORM_RECHARGE_IN` / `is_liability=true`）。
+   *
+   * 误用后果：用户余额 +N、平台现金账户无对应流水、平台负债口径少记 N。
+   * 单看 `fund_transactions` **发现不了**（平台侧那笔钱根本没记），
+   * 只有「Σ用户余额 == Σ平台负债」跨表交叉校验才暴露，**且无任何报错**。
+   *
+   * 充值主路径请改用 `PaymentService.settleRecharge`
+   * （双流水：平台负债 + 用户入账，共享 `txGroupNo`，见 F14.1 ②）。
+   *
+   * 当前无业务调用方，保留仅作「单侧冲正」的候选实现。
+   *
    * @description
    * - 金额 ≤ 0 直接拒绝（90002），**绝不调用 FundService.credit**（避免脏写）；
    * - 账户冻结（status !== ACTIVE）→ 61003；

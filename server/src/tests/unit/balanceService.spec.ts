@@ -293,3 +293,55 @@ describe('BalanceService.creditByRecharge', () => {
     expect(options.label).toBe('balance.recharge');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 5. 口径警示：creditByRecharge 是「单侧记账」，不是充值主路径
+// ---------------------------------------------------------------------------
+
+/**
+ * ⚠️ 口径警示（QA 独立验证，2026-09-09）。
+ *
+ * `BalanceService.creditByRecharge` 只写**用户侧单条** `BALANCE_RECHARGE` 流水，
+ * **不写**平台侧 `PLATFORM_RECHARGE_IN`（`is_liability = true`）的负债流水。
+ * 而充值的唯一正确口径是 `PaymentService.settleRecharge`（F14.1 ② 事务 I）的**双流水**。
+ *
+ * 误用后果（**静默、无报错**）：用户余额 +N、平台现金账户不变、平台负债口径少记 N。
+ * 单看 `fund_transactions` 单表发现不了，只有「Σ 用户余额 == Σ 平台负债」这类
+ * 跨表交叉校验才会暴露，属于最难查的一类账目漂移。
+ *
+ * 当前 `creditByRecharge` **没有任何业务调用方**（仅定义 + 本文件用例）。
+ * 下面这组用例的唯一目的是把「单侧记账」这一事实钉死：
+ * 一旦有人把它接进充值主路径、或把它改成双流水，这组用例会先红，强迫对方重新对齐口径。
+ */
+describe('BalanceService.creditByRecharge 口径警示（单侧记账，非充值主路径）', () => {
+  it('⚠️ 只产生 1 条流水：绝不写平台侧负债流水 PLATFORM_RECHARGE_IN', async () => {
+    const svc = makeSvc();
+    await svc.creditByRecharge(1n, { amount: 1000n, rechargeNo: 'R1' });
+
+    // 单侧 = 只加用户余额，平台现金账户与平台负债口径都不动
+    expect(fakeFund.credit).toHaveBeenCalledTimes(1);
+    const bizTypes = fakeFund.credit.mock.calls.map((c) => (c[0] as { bizType: string }).bizType);
+    expect(bizTypes).toEqual([FundBizType.BALANCE_RECHARGE]);
+    expect(bizTypes).not.toContain(FundBizType.PLATFORM_RECHARGE_IN);
+  });
+
+  it('⚠️ 单侧流水不带 isLiability=true（它不承担平台负债口径，与充值平台侧相反）', async () => {
+    const svc = makeSvc();
+    await svc.creditByRecharge(1n, { amount: 1000n, rechargeNo: 'R1' });
+
+    const isLiability = (fakeFund.credit.mock.calls[0]?.[0] as { isLiability?: boolean })
+      .isLiability;
+    // 未显式传 → FundService 取默认 false；无论如何都**不能**是 true
+    expect(isLiability ?? false).toBe(false);
+  });
+
+  it('⚠️ 幂等键取 rechargeNo（与 settleRecharge 用 paymentNo 不同）—— 两个口径不可混用', async () => {
+    const svc = makeSvc();
+    await svc.creditByRecharge(1n, { amount: 1000n, rechargeNo: 'RC20260910000001777777' });
+
+    const callInput = fakeFund.credit.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callInput.idempotencyKey).toBe('RC20260910000001777777');
+    // 单侧路径不锚定支付单：混用会让「按 paymentNo 反查充值流水」在对账时漏一半
+    expect(callInput.paymentNo ?? null).toBeNull();
+  });
+});
