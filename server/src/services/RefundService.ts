@@ -448,6 +448,78 @@ export class RefundService {
     );
   }
 
+  /**
+   * 查询单笔退款详情（用户视角，越权兜底）。
+   *
+   * @description `where` 必须同时带 `refundNo` 与 `userId`——退款单是私有数据。
+   * 查不到时统一抛 NotFoundError（不区分「不存在」与「不属于你」），
+   * 否则攻击者可用响应差异探测哪些退款单号真实存在。
+   * 含退款行明细 `items`（T080-C 接入后才有数据，空数组亦合法）。
+   * @param userId 用户 ID
+   * @param refundNo 退款单号
+   * @returns 退款单详情（含 items）
+   * @throws {NotFoundError} 退款单不存在或不属该用户（41001）
+   */
+  async getByNo(userId: bigint, refundNo: string) {
+    const refund = await this.prisma.refund.findFirst({
+      where: { refundNo, userId },
+      include: { items: { orderBy: { id: 'asc' } } },
+    });
+    if (refund === null) {
+      throw new NotFoundError('退款单不存在', { code: ErrorCode.REFUND_NOT_FOUND });
+    }
+    return refund;
+  }
+
+  /**
+   * 查询当前用户的退款列表（分页）。
+   *
+   * @description 按创建时间倒序，越权红线由 `where.userId` 兜底。
+   * 列表不含行明细（明细走详情接口），只返回退款单主表字段，避免大分页拖垮 DB。
+   * @param userId 用户 ID
+   * @param input 分页参数（page / pageSize）
+   * @returns { list, total }
+   */
+  async listByUser(
+    userId: bigint,
+    input: { page?: number; pageSize?: number } = {},
+  ): Promise<{ list: unknown[]; total: number }> {
+    const page = input.page ?? 1;
+    const pageSize = input.pageSize ?? 20;
+    const skip = Math.max(0, (page - 1) * pageSize);
+
+    const [rows, total] = await Promise.all([
+      this.prisma.refund.findMany({
+        where: { userId },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: pageSize,
+      }),
+      this.prisma.refund.count({ where: { userId } }),
+    ]);
+
+    return { list: rows, total };
+  }
+
+  /**
+   * 渠道退款执行失败后，将退款单标记 FAILED（订单状态不变）。
+   *
+   * @description ⚠️ **仅作为 `execute` 抛 `ExternalServiceError(4104)` 后的补偿写**，
+   * 由 HTTP 层（admin 审核端点）在捕获到该异常后调用。`execute` 自身的事务已回滚，
+   * 此时退款单停留在 PROCESSING，本方法用条件更新把它置为 FAILED 并记录失败原因，
+   * 供 F9.2 的重试 Worker（T080-C 之后）按 `next_retry_at` 指数退避重投。
+   * 条件更新 `where { refundNo, status: PROCESSING }` 保证并发下不会误改已 SUCCESS / REJECTED 的单。
+   * @param refundNo 退款单号
+   * @param reason 失败原因（来自 ExternalServiceError.message）
+   * @returns void
+   */
+  async markChannelFailed(refundNo: string, reason: string): Promise<void> {
+    await this.prisma.refund.updateMany({
+      where: { refundNo, status: RefundStatus.PROCESSING },
+      data: { status: RefundStatus.FAILED, failReason: reason, retryCount: { increment: 1 } },
+    });
+  }
+
   // --------------------------------------------------------------------------
   // 私有实现
   // --------------------------------------------------------------------------

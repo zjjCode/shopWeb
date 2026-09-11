@@ -50,7 +50,9 @@ import { categoryRouter } from '@/routes/api/category.routes';
 import { orderRouter } from '@/routes/api/order.routes';
 import { paymentRouter } from '@/routes/api/payment.routes';
 import { productRouter } from '@/routes/api/product.routes';
+import { refundRouter } from '@/routes/api/refund.routes';
 import { adminAuthRouter } from '@/routes/admin/adminAuth.routes';
+import { adminRefundRouter } from '@/routes/admin/refund.routes';
 
 /**
  * 健康检查路由。
@@ -171,6 +173,10 @@ export function createApp(): Application {
   app.use('/api', orderRouter);
   // 支付：POST /api/payments（发起支付，含幂等）；mock 确认端点仅在非生产环境注册
   app.use('/api', paymentRouter);
+  // 退款：/api/refunds（申请 / 列表 / 详情，C 端用户私有资金数据）
+  app.use('/api', refundRouter);
+  // 后台退款审核：/admin/refunds/:refundNo/audit（审核 + 触发执行）
+  app.use('/admin', adminRefundRouter);
   app.use(buildHealthRouter());
 
   // 13. 兜底 404（必须在所有业务路由之后）
