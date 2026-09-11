@@ -87,7 +87,7 @@ export const applyRefundSchema = z
       .trim()
       .min(1, '订单号不能为空')
       .max(MAX_NO_LEN, `订单号长度不可超过 ${MAX_NO_LEN}`),
-    /** 退款类型：整单退 / 部分退（部分退行级校验属 T080-C） */
+    /** 退款类型：整单退 / 部分退（部分退行级校验见 service 层 T080-C） */
     type: z.nativeEnum(RefundType, { errorMap: () => ({ message: '退款类型不合法' }) }),
     /** 退款金额（分，bigint；恒 > 0，且 ≤ 订单可退金额，service 层校验上限） */
     amount: bigintAmount,
@@ -99,6 +99,24 @@ export const applyRefundSchema = z
     voucherImages: z
       .array(z.string().trim().max(512, '凭证图片 URL 过长'))
       .max(9, '凭证图片最多 9 张')
+      .optional(),
+    /**
+     * 部分退款行明细（仅 `type=PARTIAL` 时由前端提供）：整单退由 service 自动按订单全行展开，
+     * 前端传了也忽略。每个元素含 `orderItemId`（订单行 ID）/ `quantity`（退几件）/ `amount`（退多少分）。
+     * 行级金额与数量的最终校验在 service 层（防超退 / 防伪造行），validator 只做基础形态。
+     */
+    items: z
+      .array(
+        z.object({
+          /** 订单行 ID（number 或字符串数字均可，统一转 bigint） */
+          orderItemId: z.union([z.string(), z.number()]).transform((v) => BigInt(String(v))),
+          /** 本次退款数量（正整数） */
+          quantity: z.number().int('退款数量必须为整数').positive('退款数量必须大于 0'),
+          /** 本次退款金额（分，bigint；拒 0 / 负 / 小数 / 非数字串） */
+          amount: bigintAmount,
+        }),
+      )
+      .max(50, '退款商品行最多 50 条')
       .optional(),
     // ⚠️ 红线：故意不接收 `refundTo` —— 退款去向由 service 按 payMethod 映射，前端伪造无效
   })

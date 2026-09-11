@@ -133,7 +133,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
    */
   let OUTER: {
     order: { findFirst: jest.Mock<AnyAsyncFn>; findUnique: jest.Mock<AnyAsyncFn>; updateMany: jest.Mock<AnyAsyncFn> };
-    orderItem: { updateMany: jest.Mock<AnyAsyncFn> };
+    orderItem: { findMany: jest.Mock<AnyAsyncFn>; updateMany: jest.Mock<AnyAsyncFn> };
     orderStatusLog: { create: jest.Mock<AnyAsyncFn> };
     payment: { updateMany: jest.Mock<AnyAsyncFn> };
     refund: {
@@ -172,7 +172,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
         findUnique: jest.fn<AnyAsyncFn>(),
         updateMany: jest.fn<AnyAsyncFn>(),
       },
-      orderItem: { updateMany: jest.fn<AnyAsyncFn>() },
+      orderItem: { findMany: jest.fn<AnyAsyncFn>(), updateMany: jest.fn<AnyAsyncFn>() },
       orderStatusLog: { create: jest.fn<AnyAsyncFn>() },
       payment: { updateMany: jest.fn<AnyAsyncFn>() },
       refund: {
@@ -209,6 +209,11 @@ describe('退款领域层 RefundService（T080-A）', () => {
 
     // ---- apply 默认链路 ----
     OUTER.order.findFirst.mockResolvedValue(makeOrder());
+    // 订单行（T080-C）：两行，实付 6000 + 4000 = 10000 = 订单 payAmount，均未退过
+    OUTER.orderItem.findMany.mockResolvedValue([
+      { id: 7001n, skuId: 101n, quantity: 2, payableAmount: 6000n, refundedQuantity: 0, refundedAmount: 0n, promoDiscount: 0n, allocatedDiscount: 0n },
+      { id: 7002n, skuId: 100n, quantity: 1, payableAmount: 4000n, refundedQuantity: 0, refundedAmount: 0n, promoDiscount: 0n, allocatedDiscount: 0n },
+    ]);
     OUTER.refund.findFirst.mockResolvedValue(null); // 无进行中退款单
     OUTER.refund.create.mockImplementation(async (args: { data: Record<string, unknown> }) => ({
       refundNo: args.data.refundNo,
@@ -387,6 +392,118 @@ describe('退款领域层 RefundService（T080-A）', () => {
       const arg = OUTER.refund.create.mock.calls[0]?.[0] as { data: Record<string, unknown> };
       expect(arg.data.refundTo).toBe(RefundTarget.CHANNEL);
     }
+  });
+
+  // ==========================================================================
+  // 2.5 apply —— T080-C 部分退款行级校验 + refund_items 落库
+  // ==========================================================================
+
+  it('整单退：自动按订单全行展开 refund_items（2 行，Σ 行金额 == 退款总额 10000）', async () => {
+    await expect(applyFull()).resolves.toEqual({ refundNo: REFUND_NO, status: 'PENDING' });
+
+    const data = OUTER.refund.create.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+    const items = (data.data.items as { create: Array<Record<string, unknown>> }).create;
+    expect(items).toHaveLength(2);
+    // 金额按比例折算、尾差归最后一行：6000 + 4000 = 10000
+    const sum = items.reduce((s: bigint, it: Record<string, unknown>) => s + (it.amount as bigint), 0n);
+    expect(sum).toBe(10000n);
+    expect(items[0]).toMatchObject({ quantity: 2, orderItemId: 7001n, skuId: 101n });
+    expect(items[1]).toMatchObject({ quantity: 1, orderItemId: 7002n, skuId: 100n });
+  });
+
+  it('整单退但金额 < 全行实付（比例折算）：Σ 行金额仍严格 == 退款总额 7000', async () => {
+    await applyFull({ amount: 7000n });
+    const data = OUTER.refund.create.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+    const items = (data.data.items as { create: Array<Record<string, unknown>> }).create;
+    const sum = items.reduce((s: bigint, it: Record<string, unknown>) => s + (it.amount as bigint), 0n);
+    expect(sum).toBe(7000n);
+    expect(items).toHaveLength(2);
+  });
+
+  it('整单退但订单已无可退行（全部退完）→ ConflictError 41002，且不建单', async () => {
+    OUTER.orderItem.findMany.mockResolvedValue([
+      { id: 7001n, skuId: 101n, quantity: 2, payableAmount: 6000n, refundedQuantity: 2, refundedAmount: 6000n, promoDiscount: 0n, allocatedDiscount: 0n },
+      { id: 7002n, skuId: 100n, quantity: 1, payableAmount: 4000n, refundedQuantity: 1, refundedAmount: 4000n, promoDiscount: 0n, allocatedDiscount: 0n },
+    ]);
+    await expect(applyFull()).rejects.toMatchObject({ code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+    expect(OUTER.refund.create).not.toHaveBeenCalled();
+  });
+
+  it('部分退款成功：指定 1 行退 1 件 3000 分，Σ 行金额 == 退款总额，写入 refund_items', async () => {
+    await expect(
+      svc.apply(7n, {
+        orderNo: 'SO20260910000000000001',
+        type: RefundType.PARTIAL,
+        amount: 3000n,
+        items: [{ orderItemId: 7001n, quantity: 1, amount: 3000n }],
+      }),
+    ).resolves.toEqual({ refundNo: REFUND_NO, status: 'PENDING' });
+
+    const data = OUTER.refund.create.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+    expect(data.data.type).toBe(RefundType.PARTIAL);
+    const items = (data.data.items as { create: Array<Record<string, unknown>> }).create;
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ quantity: 1, amount: 3000n, orderItemId: 7001n, skuId: 101n });
+  });
+
+  it('部分退款未指定行 → BusinessError 90002，且不建单', async () => {
+    await expect(
+      svc.apply(7n, { orderNo: 'SO20260910000000000001', type: RefundType.PARTIAL, amount: 1000n, items: [] }),
+    ).rejects.toMatchObject({ code: ErrorCode.FIELD_FORMAT_INVALID });
+    expect(OUTER.refund.create).not.toHaveBeenCalled();
+  });
+
+  it('部分退款行不属于该订单 → ConflictError 41002，且不建单', async () => {
+    await expect(
+      svc.apply(7n, {
+        orderNo: 'SO20260910000000000001',
+        type: RefundType.PARTIAL,
+        amount: 1000n,
+        items: [{ orderItemId: 9999n, quantity: 1, amount: 1000n }],
+      }),
+    ).rejects.toMatchObject({ code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+    expect(OUTER.refund.create).not.toHaveBeenCalled();
+  });
+
+  it('部分退款数量超过该行可退数量 → ConflictError 41002，且不建单', async () => {
+    // 7001 行 quantity=2 / refundedQuantity=0 → 最多退 2 件；申请 3 件超退
+    await expect(
+      svc.apply(7n, {
+        orderNo: 'SO20260910000000000001',
+        type: RefundType.PARTIAL,
+        amount: 9000n,
+        items: [{ orderItemId: 7001n, quantity: 3, amount: 9000n }],
+      }),
+    ).rejects.toMatchObject({ code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+    expect(OUTER.refund.create).not.toHaveBeenCalled();
+  });
+
+  it('部分退款金额超过该行可退金额 → ConflictError 41002，且不建单', async () => {
+    // 7001 行 payableAmount=6000 / refundedAmount=0 → 最多退 6000；申请 7000 超退
+    await expect(
+      svc.apply(7n, {
+        orderNo: 'SO20260910000000000001',
+        type: RefundType.PARTIAL,
+        amount: 7000n,
+        items: [{ orderItemId: 7001n, quantity: 1, amount: 7000n }],
+      }),
+    ).rejects.toMatchObject({ code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+    expect(OUTER.refund.create).not.toHaveBeenCalled();
+  });
+
+  it('部分退款各行金额之和 != 退款总额 → ConflictError 41002（钱不能有缺口也不能多退）', async () => {
+    await expect(
+      svc.apply(7n, {
+        orderNo: 'SO20260910000000000001',
+        type: RefundType.PARTIAL,
+        amount: 3000n,
+        items: [
+          { orderItemId: 7001n, quantity: 1, amount: 2000n },
+          { orderItemId: 7002n, quantity: 1, amount: 2000n }, // 合计 4000 != 3000
+        ],
+      }),
+    ).rejects.toMatchObject({ code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+    expect(OUTER.refund.create).not.toHaveBeenCalled();
   });
 
   // ==========================================================================

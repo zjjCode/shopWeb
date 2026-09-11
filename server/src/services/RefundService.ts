@@ -29,16 +29,16 @@
  *   `LIABILITY_SETTLE_OUT` → false 后写（负债增 / 收入减），
  *   原文见 `docs/04-flows.md` F9.3 第 1171 行。照抄 schema 注释会把负债方向记反。
  *
- * ⚠️ 本期边界（T080-A，只做领域层）：
- * - **不做 HTTP 路由 / 控制器**：那是 T080-B。
- * - **不做部分退款的行级校验与 `refund_items` 落库**：那是 T080-C。
- *   本批 `execute` 只**消费**已存在的 `refund_items`（空则跳过），`apply` 不写行明细。
+ * ⚠️ 本期边界：
+ * - **HTTP 路由 / 控制器**：T080-B 已完成（`refund.routes.ts` / `AdminRefundController.ts`），本文件只出领域能力。
+ * - **部分退款行级校验与 `refund_items` 落库**：T080-C 已完成——`apply` 现在会做行级校验并把明细
+ *   嵌套写入 `refund_items`（`execute` 只**消费**这些明细，空则跳过）。
  * - **渠道退款（refundTo=CHANNEL）不实现**：一期没有 `PaymentAdapter`，无法确认渠道真的退成功。
  *   本批明确抛 `ExternalServiceError` 41004 并中止，**绝不记账**（F9.2「订单状态不变」）。
  * - **不接入 IdempotencyService**：幂等记录收尾留 TODO（T080-B 随队列 Worker 一起接）。
  */
 
-import type { PrismaClient } from '@prisma/client';
+import type { Prisma, PrismaClient } from '@prisma/client';
 import {
   OperatorType,
   OrderStatus,
@@ -63,6 +63,26 @@ import { withTransaction } from '@/core/transaction';
 import { FundService, type TxClient } from '@/services/FundService';
 import { StockService } from '@/services/StockService';
 
+/** 执行退款时需要的订单行字段（部分退款行级校验 / 整单退自动展开） */
+type LoadedOrderItem = {
+  id: bigint;
+  skuId: bigint;
+  quantity: number;
+  /** 行实付（分）= goodsAmount - promoDiscount - allocatedDiscount */
+  payableAmount: bigint;
+  /** 已退数量（部分退款行级校验用） */
+  refundedQuantity: number;
+  /** 已退金额（分，部分退款行级校验用） */
+  refundedAmount: bigint;
+  /** 行级促销优惠（整单退原样退回） */
+  promoDiscount: bigint;
+  /** 行分摊优惠（整单退原样退回） */
+  allocatedDiscount: bigint;
+};
+
+/** refund_items 可插入行（T080-C，使用 Unchecked 变体：直接写 orderItemId / skuId 标量外键） */
+type RefundItemCreate = Prisma.RefundItemUncheckedCreateWithoutRefundInput;
+
 /** 本服务用到的 Prisma 委托（单测注入假实现时只需实现这些） */
 type DbClient = Pick<
   PrismaClient,
@@ -75,11 +95,21 @@ type DbClient = Pick<
   | 'fundAccount'
 >;
 
+/** 部分退款的单个商品行入参（前端传入，仅 PARTIAL 使用） */
+export interface RefundItemInput {
+  /** 订单行 ID（必须属于该订单，否则 41002 拒收） */
+  orderItemId: bigint;
+  /** 本次退款数量（0 < quantity ≤ 该行剩余可退数量） */
+  quantity: number;
+  /** 本次退款金额（分，bigint；0 < amount ≤ 该行剩余实付） */
+  amount: bigint;
+}
+
 /** 申请退款入参 */
 export interface ApplyRefundInput {
   /** 订单号（必须属于当前用户，见 {@link RefundService.apply} 的越权校验） */
   orderNo: string;
-  /** 退款类型：整单退 / 部分退（部分退的行级校验属 T080-C） */
+  /** 退款类型：整单退 / 部分退 */
   type: RefundType;
   /** 退款金额（分，bigint；恒 > 0，且 ≤ 订单可退金额） */
   amount: bigint;
@@ -89,6 +119,8 @@ export interface ApplyRefundInput {
   reasonText?: string | null;
   /** 凭证图片 URL 列表 */
   voucherImages?: string[] | null;
+  /** 部分退款行明细（仅 PARTIAL 必填；FULL 由 service 自动按订单全行展开，前端传了也忽略） */
+  items?: RefundItemInput[] | null;
 }
 
 /** 申请退款结果 */
@@ -188,6 +220,9 @@ export class RefundService {
     // ---------- 1~3：订单归属 + 状态 + 售后期 ----------
     const order = await this.loadRefundableOrder(userId, dto.orderNo);
 
+    // ---------- 3.5：读取订单行（部分退款行级校验 / 整单退自动展开都依赖它）----------
+    const orderItems = await this.loadOrderItems(order.id);
+
     // ---------- 4：是否已有进行中的退款单 ----------
     const inProgress = await this.prisma.refund.findFirst({
       where: { orderId: order.id, status: { in: [...IN_PROGRESS_REFUND_STATUS] } },
@@ -214,7 +249,13 @@ export class RefundService {
       });
     }
 
-    // ---------- 7：建 PENDING 单 ----------
+    // ---------- 6.5：行级校验 + 展开 refund_items（T080-C）----------
+    // 整单退：按订单全行自动展开（金额按比例折算、尾差归最后一行，保证 Σ 行金额 == 退款总额）；
+    // 部分退：逐行校验「数量 / 金额不超该行可退」，且各行金额之和必须等于退款总额
+    // （钱不能有缺口也不能多退）。校验出的行明细随退款单一并落入 refund_items。
+    const refundItems = this.buildRefundItems(orderItems, dto);
+
+    // ---------- 7：建 PENDING 单（含 refund_items 嵌套写入，单条 Prisma 调用即原子）----------
     const refundNo = IdGenerator.refundNo();
     const created = await this.prisma.refund.create({
       data: {
@@ -231,7 +272,10 @@ export class RefundService {
         reasonCode: dto.reasonCode ?? null,
         reasonText: dto.reasonText ?? null,
         voucherImages: dto.voucherImages ?? undefined,
-      },
+        // 退款行明细：整单退自动展开全行，部分退由前端指定并经行级校验；
+        // 嵌套 create 与退款主表同属一次 Prisma 写入，要么都成要么都不成。
+        items: { create: refundItems },
+      } as Prisma.RefundUncheckedCreateInput,
     });
 
     return { refundNo: created.refundNo, status: created.status };
@@ -565,6 +609,157 @@ export class RefundService {
   }
 
   /**
+   * 读取订单行（含行级已退量 / 已退额，用于部分退款行级校验与整单退自动展开）。
+   *
+   * @param orderId 订单 ID
+   * @returns 订单行列表（按 id 升序）
+   */
+  private async loadOrderItems(orderId: bigint): Promise<LoadedOrderItem[]> {
+    return this.prisma.orderItem.findMany({
+      where: { orderId },
+      orderBy: { id: 'asc' },
+      select: {
+        id: true,
+        skuId: true,
+        quantity: true,
+        payableAmount: true,
+        refundedQuantity: true,
+        refundedAmount: true,
+        promoDiscount: true,
+        allocatedDiscount: true,
+      },
+    });
+  }
+
+  /**
+   * 根据退款类型构建 refund_items（T080-C 行级）。
+   *
+   * @description 整单退 → {@link buildFullRefundItems}；部分退 → {@link buildPartialRefundItems}。
+   * @param orderItems 订单行
+   * @param dto 申请入参（含 type 与可选 items）
+   * @returns 可直插 refund_items 的行数据
+   */
+  private buildRefundItems(orderItems: LoadedOrderItem[], dto: ApplyRefundInput): RefundItemCreate[] {
+    return dto.type === RefundType.FULL
+      ? this.buildFullRefundItems(orderItems, dto.amount)
+      : this.buildPartialRefundItems(orderItems, dto.items ?? [], dto.amount);
+  }
+
+  /**
+   * 整单退：按订单全行「剩余可退」自动展开为 refund_items。
+   *
+   * @description 每行退款数量 = 行剩余数量（quantity - refundedQuantity）；
+   * 每行退款金额 = 行剩余实付（payableAmount - refundedAmount）按比例折算到本次退款总额，
+   * **向下取整**，**尾差归最后一行**，保证 Σ 行金额 === refund.amount（钱不丢不重）。
+   * 无剩余可退行（如已全部退完）→ 41002 拒收。
+   * @param orderItems 订单行
+   * @param amount 整单退款总额（分）
+   * @returns refund_items 行数据
+   * @throws {ConflictError} 无可退商品行（41002）
+   */
+  private buildFullRefundItems(orderItems: LoadedOrderItem[], amount: bigint): RefundItemCreate[] {
+    const eligible = orderItems
+      .map((oi) => ({
+        oi,
+        remainingQty: oi.quantity - oi.refundedQuantity,
+        remainingPayable: oi.payableAmount - oi.refundedAmount,
+      }))
+      .filter((x) => x.remainingQty > 0 && x.remainingPayable > 0);
+
+    if (eligible.length === 0) {
+      throw new ConflictError('订单没有可退款的商品行', { code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+    }
+
+    const remainingTotal = eligible.reduce((sum, x) => sum + x.remainingPayable, 0n);
+    let allocated = 0n;
+
+    return eligible.map((x, idx) => {
+      const isLast = idx === eligible.length - 1;
+      // 按比例折算：非末行直接 floor 除法；末行吃掉尾差，保证 Σ === amount
+      const lineAmount = isLast ? amount - allocated : (x.remainingPayable * amount) / remainingTotal;
+      allocated += lineAmount;
+      return {
+        orderItemId: x.oi.id,
+        skuId: x.oi.skuId,
+        quantity: x.remainingQty,
+        amount: lineAmount,
+        promoDiscountRefund: x.oi.promoDiscount,
+        allocatedDiscountRefund: x.oi.allocatedDiscount,
+      };
+    });
+  }
+
+  /**
+   * 部分退款：逐行校验「数量 / 金额不超该行可退」，且 Σ 行金额 === 退款总额。
+   *
+   * @description 资金安全红线（T080-C 核心）：
+   * - 每行必须属于该订单（防止伪造成别人的行）；
+   * - 0 < 数量 ≤ 行剩余数量；0 < 金额 ≤ 行剩余实付；
+   * - **Σ 行金额必须 === refund.amount**：前端报的「总退多少」与「每行退多少」必须自洽，
+   *   否则要么钱退少了（用户亏）、要么退多了（平台亏）。
+   * @param orderItems 订单行
+   * @param items 前端传入的部分退款行（含 orderItemId / quantity / amount）
+   * @param amount 退款总额（分）
+   * @returns refund_items 行数据
+   * @throws {BusinessError} 未指定行 / 数量或金额非法（90002）
+   * @throws {ConflictError} 行不属于订单 / 超退（41002）
+   */
+  private buildPartialRefundItems(
+    orderItems: LoadedOrderItem[],
+    items: RefundItemInput[],
+    amount: bigint,
+  ): RefundItemCreate[] {
+    if (items.length === 0) {
+      throw new BusinessError('部分退款必须指定退款商品行', { code: ErrorCode.FIELD_FORMAT_INVALID });
+    }
+
+    const byId = new Map(orderItems.map((oi) => [oi.id, oi] as const));
+    const result: RefundItemCreate[] = [];
+    let sum = 0n;
+
+    for (const it of items) {
+      const oi = byId.get(it.orderItemId);
+      if (oi === undefined) {
+        throw new ConflictError('退款行不属于该订单', { code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+      }
+
+      const remainingQty = oi.quantity - oi.refundedQuantity;
+      const remainingPayable = oi.payableAmount - oi.refundedAmount;
+
+      if (it.quantity <= 0) {
+        throw new BusinessError('退款数量必须大于 0', { code: ErrorCode.FIELD_FORMAT_INVALID });
+      }
+      if (it.quantity > remainingQty) {
+        throw new ConflictError('退款数量超过该行可退数量', { code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+      }
+      if (it.amount <= 0n) {
+        throw new BusinessError('退款金额必须大于 0', { code: ErrorCode.FIELD_FORMAT_INVALID });
+      }
+      if (it.amount > remainingPayable) {
+        throw new ConflictError('退款金额超过该行可退金额', { code: ErrorCode.REFUND_AMOUNT_EXCEEDED });
+      }
+
+      result.push({
+        orderItemId: oi.id,
+        skuId: oi.skuId,
+        quantity: it.quantity,
+        amount: it.amount,
+        promoDiscountRefund: 0n,
+        allocatedDiscountRefund: 0n,
+      });
+      sum += it.amount;
+    }
+
+    if (sum !== amount) {
+      throw new ConflictError('部分退款各行金额之和必须等于退款总额', {
+        code: ErrorCode.REFUND_AMOUNT_EXCEEDED,
+      });
+    }
+
+    return result;
+  }
+
+  /**
    * 由订单支付方式映射退款去向。
    *
    * @description **单一来源原则**：`payMethod = BALANCE` 说明钱是从用户余额扣的，
@@ -641,8 +836,7 @@ export class RefundService {
    * 行明细为空（整单退未落 `refund_items`、或 T080-C 未接入）时本方法是 no-op ——
    * 订单行累计与库存回仓留给 T080-C 按行级口径补全，**不在此处兜底造数据**。
    *
-   * TODO(T080-C)：部分退款行级 —— 本方法目前只消费 `refund_items`，
-   * `apply` 侧的行级校验（`Σ refund_items.actualAmount ≤ 可退金额`）尚未实现。
+   * T080-C 已完成：`apply` 侧已做行级校验并把明细落入 `refund_items`，本方法只负责消费。
    *
    * @param tx 事务 C 的客户端
    * @param refund 退款单
