@@ -76,6 +76,21 @@ export class OrderController {
     await orderService.cancelByUser(currentUserId(req), orderNo, body.reason ?? null);
     sendOk(res, { orderNo, cancelled: true });
   }
+
+  /**
+   * 确认收货（F10 ③，仅 C 端用户）。
+   *
+   * @description 越权防护由 service 层以 `userId` 兜底（越权或缺单统一 31001）。
+   * 响应体：`{ orderNo, completed: true }`。
+   * @param req Express 请求（orderNo 来自路由参数）
+   * @param res Express 响应
+   * @returns void
+   */
+  async confirm(req: Request, res: Response): Promise<void> {
+    const { orderNo } = req.params as { orderNo: string };
+    await orderService.confirmReceipt(currentUserId(req), orderNo);
+    sendOk(res, { orderNo, completed: true });
+  }
 }
 
 /** 默认单例 */

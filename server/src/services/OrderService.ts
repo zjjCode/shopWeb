@@ -41,6 +41,8 @@ import { QUEUE_NAMES } from '@/config/constants';
 import { BusinessError, ValidationError } from '@/core/errors';
 import { ErrorCode } from '@/core/errors/errorCodes';
 import { enqueue } from '@/core/queue';
+import type { OrderCompletedEvent } from '@/core/eventBus';
+import { emit } from '@/core/eventBus';
 import { orderNo as generateOrderNo } from '@/core/idGenerator';
 import { getPrisma } from '@/core/prisma';
 import { withTransaction } from '@/core/transaction';
@@ -82,6 +84,15 @@ export interface CreateOrderResult {
 
 /** 支付超时时长（分钟）：与 F5「expire_at = NOW() + 30min」一致 */
 const PAY_TIMEOUT_MINUTES = 30;
+
+/** 发货后自动确认收货天数（F10：auto_confirm_at = shippedAt + 15 天） */
+const AUTO_CONFIRM_DAYS = 15;
+
+/** 确认收货后售后期天数（F10：after_sale_expire_at = completedAt + 7 天） */
+const AFTER_SALE_DAYS = 7;
+
+/** 一天的毫秒数 */
+const DAY_MS = 86_400_000;
 
 /** 单 SKU 数量上限（与购物车校验一致） */
 const MAX_QUANTITY_PER_SKU = 999;
@@ -334,6 +345,201 @@ export class OrderService {
     );
 
     return { skipped: affected === 0 };
+  }
+
+  // ==========================================================================
+  // 发货 / 确认收货 / 自动确认（F10）
+  // ==========================================================================
+
+  /**
+   * 管理员发货（F10 ①）：PAID → SHIPPED。
+   *
+   * @description 写入物流公司编码/名称/运单号 + `autoConfirmAt = shippedAt + 15 天`；
+   * 仅 `PAID` 可发货（非 PAID 抛 31002），订单不存在抛 31001。
+   * 事务提交后 best-effort 投递延迟自动确认 job（delay = 15 天，jobId = orderNo 去重），
+   * 投递失败仅 warn（不阻塞发货），靠 cron 兜底扫描补偿（F7.2 / F10）。
+   * @param adminId 管理员 ID
+   * @param orderNo 订单号
+   * @param dto 物流信息（companyCode / companyName / trackingNo / remark）
+   * @throws {BusinessError} 31001 订单不存在；31002 状态不允许发货
+   */
+  async ship(
+    adminId: bigint,
+    orderNo: string,
+    dto: { companyCode: string; companyName: string; trackingNo: string; remark?: string | null },
+  ): Promise<void> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderNo },
+      select: { id: true, status: true },
+    });
+    if (order === null) {
+      throw new BusinessError('订单不存在', { code: ErrorCode.ORDER_NOT_FOUND, httpStatus: 404 });
+    }
+    if (order.status !== OrderStatus.PAID) {
+      throw new BusinessError('仅已支付订单可发货', {
+        code: ErrorCode.ORDER_STATUS_INVALID,
+        httpStatus: 409,
+      });
+    }
+
+    const shippedAt = new Date();
+    const autoConfirmAt = new Date(shippedAt.getTime() + AUTO_CONFIRM_DAYS * DAY_MS);
+
+    const affected = await withTransaction(
+      async (tx) => {
+        const n = await transition(tx, {
+          orderId: order.id,
+          orderNo,
+          fromStatus: OrderStatus.PAID,
+          toStatus: OrderStatus.SHIPPED,
+          operatorType: OperatorType.ADMIN,
+          operatorId: adminId,
+          reason: dto.remark ?? null,
+          logExtra: { logisticsNo: dto.trackingNo },
+          extraData: {
+            shippedAt,
+            logisticsCompanyCode: dto.companyCode,
+            logisticsCompanyName: dto.companyName,
+            logisticsNo: dto.trackingNo,
+            autoConfirmAt,
+          },
+        });
+        return n;
+      },
+      { label: 'order.ship' },
+    );
+
+    if (affected === 0) {
+      // 并发已变（极端情况）：幂等跳过，不二次投递
+      return;
+    }
+
+    // 事务提交后：注册延迟自动确认 job（F10 触发方式 A）
+    if (config.env !== 'test') {
+      const delayMs = Math.max(0, autoConfirmAt.getTime() - Date.now());
+      void enqueue(QUEUE_NAMES.ORDER_AUTO_CONFIRM, 'autoConfirmReceipt', { orderNo }, { jobId: orderNo, delayMs });
+    }
+  }
+
+  /**
+   * 用户确认收货（F10 ③）：SHIPPED → COMPLETED。
+   *
+   * @description 完成后 `afterSaleExpireAt = completedAt + 7 天`（售后期）。
+   * 越权防护：`where` 必须带 `userId`，越权或缺单统一 31001；仅 `SHIPPED` 可确认（否则 31002）。
+   * 事务提交后 `eventBus.emit('order.completed')` —— 一期为空监听器（二阶段在此发放积分，见 `02-architecture.md` §8）。
+   * @param userId 用户 ID（只从 `req.auth` 取，绝不从 body 读）
+   * @param orderNo 订单号
+   * @throws {BusinessError} 31001 订单不存在/不属于该用户；31002 状态不允许确认收货
+   */
+  async confirmReceipt(userId: bigint, orderNo: string): Promise<void> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderNo, userId },
+      select: { id: true, status: true, userId: true, payAmount: true },
+    });
+    if (order === null) {
+      throw new BusinessError('订单不存在', { code: ErrorCode.ORDER_NOT_FOUND, httpStatus: 404 });
+    }
+    if (order.status !== OrderStatus.SHIPPED) {
+      throw new BusinessError('仅已发货订单可确认收货', {
+        code: ErrorCode.ORDER_STATUS_INVALID,
+        httpStatus: 409,
+      });
+    }
+
+    const completedAt = new Date();
+    const afterSaleExpireAt = new Date(completedAt.getTime() + AFTER_SALE_DAYS * DAY_MS);
+
+    const affected = await withTransaction(
+      async (tx) => {
+        const n = await transition(tx, {
+          orderId: order.id,
+          orderNo,
+          fromStatus: OrderStatus.SHIPPED,
+          toStatus: OrderStatus.COMPLETED,
+          operatorType: OperatorType.USER,
+          operatorId: userId,
+          extraData: { completedAt, afterSaleExpireAt },
+        });
+        return n;
+      },
+      { label: 'order.confirmReceipt' },
+    );
+
+    if (affected === 0) {
+      return; // 并发已变，幂等跳过
+    }
+
+    // 事务提交后：积分发放钩子（一期空实现）
+    const payload: OrderCompletedEvent = {
+      orderId: Number(order.id),
+      orderNo,
+      userId: Number(order.userId),
+      payAmount: Number(order.payAmount),
+      completedAt,
+    };
+    emit('order.completed', payload);
+  }
+
+  /**
+   * 系统自动确认收货（F10 ④）：SHIPPED → COMPLETED（SYSTEM，reason=AUTO_CONFIRM）。
+   *
+   * @description 由 BullMQ 延迟 job（发货时注册）或 cron 兜底扫描调用。
+   * 无前置查询（靠条件更新 + `affectedRows` 幂等），已非 SHIPPED 的视为 skipped。
+   * @param orderNo 订单号
+   * @returns `{ skipped: true }` 表示订单不存在或已不在已发货态（幂等跳过）
+   */
+  async autoConfirm(orderNo: string): Promise<{ skipped: boolean }> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderNo },
+      select: { id: true, status: true },
+    });
+    if (order === null || order.status !== OrderStatus.SHIPPED) {
+      return { skipped: true };
+    }
+
+    const completedAt = new Date();
+    const afterSaleExpireAt = new Date(completedAt.getTime() + AFTER_SALE_DAYS * DAY_MS);
+
+    const affected = await withTransaction(
+      async (tx) => {
+        const n = await transition(tx, {
+          orderId: order.id,
+          orderNo,
+          fromStatus: OrderStatus.SHIPPED,
+          toStatus: OrderStatus.COMPLETED,
+          operatorType: OperatorType.SYSTEM,
+          operatorId: 0n,
+          reason: 'AUTO_CONFIRM',
+          extraData: { completedAt, afterSaleExpireAt },
+        });
+        // 自动确认不发放积分钩子（仅用户主动确认走积分，设计约定）；如二阶段需统一，可在此补 emit
+        return n;
+      },
+      { label: 'order.autoConfirm' },
+    );
+
+    return { skipped: affected === 0 };
+  }
+
+  /**
+   * 扫描「已发货且超过自动确认时间」的订单（F7.2 / F10 兜底扫描条件）。
+   *
+   * @description `WHERE status='SHIPPED' AND auto_confirm_at < NOW()`，走 `idx_status_autoconfirm` 索引；
+   * 按 `id` 升序分页。`LIMIT` 由调用方传入（默认 500）。
+   * @param limit 单批上限
+   * @returns 待自动确认的订单号列表
+   */
+  async scanReceivableOrders(limit: number = 500): Promise<string[]> {
+    const rows = await this.prisma.order.findMany({
+      where: {
+        status: OrderStatus.SHIPPED,
+        autoConfirmAt: { lt: new Date() },
+      },
+      select: { orderNo: true },
+      orderBy: { id: 'asc' },
+      take: limit,
+    });
+    return rows.map((row) => row.orderNo);
   }
 
   /**

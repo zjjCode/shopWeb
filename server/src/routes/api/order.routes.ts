@@ -78,6 +78,15 @@ export function createOrderRouter(): Router {
     asyncHandler(orderController.cancel),
   );
 
+  // 确认收货（F10 ③）：越权防护在 service 层以 userId 兜底
+  router.post(
+    '/orders/:orderNo/confirm',
+    auth({ scope: 'shop' }),
+    orderCreateRateLimit(),
+    validate({ params: orderNoParamSchema }),
+    asyncHandler(orderController.confirm),
+  );
+
   return router;
 }
 

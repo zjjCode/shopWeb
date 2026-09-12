@@ -26,18 +26,31 @@ import { QUEUE_NAMES } from '@/config/constants';
 import { getQueueConnection } from '@/core/queue';
 import { logError, logInfo } from '@/core/logger/logger';
 import { closeTimeoutOrder, scanExpiredOrders } from './handlers/closeTimeoutOrder.job';
+import { autoConfirmReceipt, scanReceivableOrders } from './handlers/autoConfirmReceipt.job';
 
 /** cron 兜底扫描间隔（毫秒）：F7.2 规定 1 分钟 */
 const SCAN_INTERVAL_MS = 60_000;
 
+/** 自动确认收货 cron 兜底扫描间隔（毫秒）：F10 规定 1 小时 */
+const AUTO_CONFIRM_SCAN_INTERVAL_MS = 3_600_000;
+
 /** 延迟关单 job 的处理并发（对齐 QUEUE_LIMITS[ORDER_CLOSE].concurrency） */
 const CLOSE_CONCURRENCY = 3;
+
+/** 自动确认 job 的处理并发（对齐 QUEUE_LIMITS[ORDER_AUTO_CONFIRM].concurrency） */
+const AUTO_CONFIRM_CONCURRENCY = 2;
 
 /** 轮询定时器（cron 兜底扫描） */
 let scanTimer: ReturnType<typeof setInterval> | null = null;
 
+/** 自动确认兜底扫描定时器 */
+let autoConfirmTimer: ReturnType<typeof setInterval> | null = null;
+
 /** BullMQ Worker（消费延迟关单 job） */
 let closeWorker: Worker | null = null;
+
+/** BullMQ Worker（消费延迟自动确认 job） */
+let autoConfirmWorker: Worker | null = null;
 
 /**
  * 从 job 数据中抽取订单号。
@@ -103,6 +116,39 @@ export function startScheduler(): void {
 
   void tick(); // 启动即补偿一次（覆盖服务重启期间堆积的超时单）
   scanTimer = setInterval(tick, SCAN_INTERVAL_MS);
+
+  // ③ Worker：消费发货时注册的延迟自动确认 job（F10 触发方式 A，精确）
+  autoConfirmWorker = new Worker(
+    QUEUE_NAMES.ORDER_AUTO_CONFIRM,
+    async (job: Job) => {
+      const orderNo = extractOrderNo(job.data);
+      if (orderNo !== undefined) {
+        await autoConfirmReceipt(orderNo);
+      }
+    },
+    { connection: getQueueConnection(), concurrency: AUTO_CONFIRM_CONCURRENCY },
+  );
+  autoConfirmWorker.on('error', (error: Error) => {
+    logError('scheduler.worker_error', error, { ctx: { queue: QUEUE_NAMES.ORDER_AUTO_CONFIRM } });
+  });
+
+  // ④ 自动确认 cron 兜底扫描（F7.2 触发方式 B，每小时；防 job 丢失 / 服务重启）
+  const autoTick = async (): Promise<void> => {
+    try {
+      const orderNos = await scanReceivableOrders();
+      for (const orderNo of orderNos) {
+        await autoConfirmReceipt(orderNo);
+      }
+      if (orderNos.length > 0) {
+        logInfo('scheduler.auto_confirm_scan_done', { ctx: { confirmed: orderNos.length } });
+      }
+    } catch (error) {
+      logError('scheduler.auto_confirm_scan_failed', error);
+    }
+  };
+
+  void autoTick(); // 启动即补偿一次（覆盖服务重启期间堆积的待确认单）
+  autoConfirmTimer = setInterval(autoTick, AUTO_CONFIRM_SCAN_INTERVAL_MS);
 }
 
 /**
@@ -115,9 +161,18 @@ export async function stopScheduler(): Promise<void> {
     clearInterval(scanTimer);
     scanTimer = null;
   }
+  if (autoConfirmTimer !== null) {
+    clearInterval(autoConfirmTimer);
+    autoConfirmTimer = null;
+  }
   if (closeWorker !== null) {
     const worker = closeWorker;
     closeWorker = null;
+    await worker.close();
+  }
+  if (autoConfirmWorker !== null) {
+    const worker = autoConfirmWorker;
+    autoConfirmWorker = null;
     await worker.close();
   }
 }

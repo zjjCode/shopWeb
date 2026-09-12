@@ -53,6 +53,7 @@ import { productRouter } from '@/routes/api/product.routes';
 import { refundRouter } from '@/routes/api/refund.routes';
 import { adminAuthRouter } from '@/routes/admin/adminAuth.routes';
 import { adminRefundRouter } from '@/routes/admin/refund.routes';
+import { adminOrderRouter } from '@/routes/admin/order.routes';
 
 /**
  * 健康检查路由。
@@ -177,6 +178,8 @@ export function createApp(): Application {
   app.use('/api', refundRouter);
   // 后台退款审核：/admin/refunds/:refundNo/audit（审核 + 触发执行）
   app.use('/admin', adminRefundRouter);
+  // 后台发货：/admin/orders/:orderNo/ship（F10 ①，rbac(admin:order:ship)）
+  app.use('/admin', adminOrderRouter);
   app.use(buildHealthRouter());
 
   // 13. 兜底 404（必须在所有业务路由之后）

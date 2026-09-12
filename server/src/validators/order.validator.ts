@@ -107,3 +107,41 @@ export const cancelOrderSchema = z
 
 /** 取消订单入参类型 */
 export type CancelOrderInput = z.infer<typeof cancelOrderSchema>;
+
+/**
+ * 发货入参（body）：POST /admin/orders/:orderNo/ship（F10 ①）
+ *
+ * @description 物流公司编码/名称/运单号为必填；管理员备注可空。
+ * 严格 unknown 字段 400（§7.3）。
+ */
+export const shipOrderSchema = z
+  .object({
+    /** 物流公司编码（如 SF / YTO，对应 `logistics_company_code` VarChar(32)） */
+    companyCode: z
+      .string()
+      .trim()
+      .min(1, '物流公司编码不能为空')
+      .max(32, '物流公司编码不可超过 32 字'),
+    /** 物流公司名称（对应 `logistics_company_name` VarChar(64)） */
+    companyName: z
+      .string()
+      .trim()
+      .min(1, '物流公司名称不能为空')
+      .max(64, '物流公司名称不可超过 64 字'),
+    /** 运单号（对应 `logistics_no` VarChar(64)） */
+    trackingNo: z
+      .string()
+      .trim()
+      .min(1, '运单号不能为空')
+      .max(64, '运单号不可超过 64 字'),
+    /** 管理员发货备注（可空，对应 `admin_remark` VarChar(255)） */
+    remark: z
+      .string()
+      .trim()
+      .max(255, '发货备注不可超过 255 字')
+      .nullish(),
+  })
+  .strict();
+
+/** 发货入参类型 */
+export type ShipOrderBody = z.infer<typeof shipOrderSchema>;
