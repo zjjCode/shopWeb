@@ -59,6 +59,23 @@ export class OrderController {
     const result = await orderService.createOrder(currentUserId(req), dto);
     sendOk(res, result);
   }
+
+  /**
+   * 取消「待支付」订单（F8 路径 1，仅 C 端用户）。
+   *
+   * @description 越权防护由 service 层以 `userId` 兜底（越权或缺单统一 31001）；
+   * 本期仅允许待支付订单取消，已支付取消需走退款流程（见 F9）。
+   * 响应体：`{ orderNo, cancelled: true }`。
+   * @param req Express 请求（orderNo 来自路由参数，reason 来自 body）
+   * @param res Express 响应
+   * @returns void
+   */
+  async cancel(req: Request, res: Response): Promise<void> {
+    const { orderNo } = req.params as { orderNo: string };
+    const body = (req.body ?? {}) as { reason?: string | null };
+    await orderService.cancelByUser(currentUserId(req), orderNo, body.reason ?? null);
+    sendOk(res, { orderNo, cancelled: true });
+  }
 }
 
 /** 默认单例 */

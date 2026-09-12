@@ -31,7 +31,11 @@ import { auth } from '@/middlewares/auth';
 import { idempotency } from '@/middlewares/idempotency';
 import { rateLimit } from '@/middlewares/rateLimit';
 import { validate } from '@/middlewares/validate';
-import { createOrderSchema } from '@/validators/order.validator';
+import {
+  cancelOrderSchema,
+  createOrderSchema,
+  orderNoParamSchema,
+} from '@/validators/order.validator';
 
 /**
  * 下单限流：10 次 / 分钟（F5.1 明确要求，比默认 120 次严格得多）。
@@ -63,6 +67,15 @@ export function createOrderRouter(): Router {
     idempotency({ scope: IDEMPOTENT_SCOPE.ORDER_CREATE }),
     validate({ body: createOrderSchema }),
     asyncHandler(orderController.create),
+  );
+
+  // 取消「待支付」订单（F8 路径 1）：越权防护在 service 层以 userId 兜底
+  router.post(
+    '/orders/:orderNo/cancel',
+    auth({ scope: 'shop' }),
+    orderCreateRateLimit(),
+    validate({ params: orderNoParamSchema, body: cancelOrderSchema }),
+    asyncHandler(orderController.cancel),
   );
 
   return router;

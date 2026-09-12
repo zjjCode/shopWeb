@@ -20,19 +20,31 @@
  *
  * 死锁预防：多 SKU 冻结严格按 `sku_id` **升序**处理，保证不同订单对同一批 SKU 的加锁顺序一致（F5.3）。
  *
- * ⚠️ 本期边界（T050）：
+ * ⚠️ 本期边界（T050 / T051）：
  * - **不做券**：`couponId` 一律按 null 处理，不写 `order_coupon_records`。券占用必须与建单同事务，
- *   待 T041 的 CouponService 就绪后在此补（见阶段 3 的 TODO）。
- * - **不注册延迟关单 job**：T060 接入 BullMQ 后再补，注册失败仅 warn、不阻塞下单。
+ *   待 T041 的 CouponService 就绪后在此补（见阶段 3 的 TODO）。关单/取消时亦无券可解冻（见 T051）。
+ * - **注册延迟关单 job**：T051 已接入 BullMQ `order-close` 队列（delay = expireAt - now，jobId = orderNo），
+ *   注册失败仅 warn、不阻塞下单，靠 cron 兜底扫描补偿（F7.2 / F10）。
  */
 
-import type { PrismaClient } from '@prisma/client';
-import { OrderStatus, OperatorType, ProductStatus, SkuStatus } from '@prisma/client';
+import type { Prisma, PrismaClient } from '@prisma/client';
+import {
+  CancelReason,
+  OrderStatus,
+  OperatorType,
+  PayStatus,
+  ProductStatus,
+  SkuStatus,
+} from '@prisma/client';
+import { config } from '@/config';
+import { QUEUE_NAMES } from '@/config/constants';
 import { BusinessError, ValidationError } from '@/core/errors';
 import { ErrorCode } from '@/core/errors/errorCodes';
+import { enqueue } from '@/core/queue';
 import { orderNo as generateOrderNo } from '@/core/idGenerator';
 import { getPrisma } from '@/core/prisma';
 import { withTransaction } from '@/core/transaction';
+import { transition } from '@/services/OrderStateMachine';
 import {
   FREIGHT_FREE_THRESHOLD_CENTS,
   PriceService,
@@ -262,11 +274,233 @@ export class OrderService {
     );
 
     // ---------- 阶段 4：事务提交后 ----------
-    // TODO(T060)：接入 BullMQ 后在此注册延迟关单 job
-    // queue.add('closeTimeoutOrder', { orderNo }, { delay: expireAt - now, jobId: orderNo })
-    // 注册失败仅 warn 不抛错（不阻塞下单），靠 cron 兜底扫描补偿（F5.3）。
+    // 注册延迟关单 job（F10 触发方式 A）：delay = expireAt - now，jobId = orderNo 天然去重。
+    // 投递失败仅 warn 不抛错（不阻塞下单），靠 cron 兜底扫描补偿（F7.2 / F10）。
+    if (config.env !== 'test') {
+      const delayMs = Math.max(0, expireAt.getTime() - Date.now());
+      void enqueue(QUEUE_NAMES.ORDER_CLOSE, 'closeTimeoutOrder', { orderNo }, { jobId: orderNo, delayMs });
+    }
 
     return { orderNo, payAmount: price.payAmount, expireAt };
+  }
+
+  // ==========================================================================
+  // 取消 / 超时关单（F8 / F10）
+  // ==========================================================================
+
+  /**
+   * 超时关单（系统触发）：PENDING_PAYMENT → CANCELLED（F10）。
+   *
+   * 同事务副作用：**释放冻结库存**（`frozen → available`，ORDER_RELEASE）+ **关闭待支付支付单**
+   * （若有；下单即支付场景下此时通常尚无支付单）。**无资金流水、无券**（本期券未占用，见 T050）。
+   *
+   * 幂等保障（F7.2 / F10）：
+   * - 进入事务前先 `WHERE status='PENDING_PAYMENT'` 预筛，已支付/已取消/已关单的直接跳过；
+   * - 事务内状态更新仍带 `WHERE status='PENDING_PAYMENT'`，`affectedRows = 0` 视为并发已变、幂等跳过，
+   *   绝不会重复释放库存。
+   *
+   * @param orderNo 订单号
+   * @returns `{ skipped: true }` 表示订单不存在或已不在待支付态（幂等跳过）
+   */
+  async closeByTimeout(orderNo: string): Promise<{ skipped: boolean }> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderNo },
+      select: { id: true, status: true },
+    });
+    if (order === null || order.status !== OrderStatus.PENDING_PAYMENT) {
+      return { skipped: true };
+    }
+
+    const affected = await withTransaction(
+      async (tx) => {
+        const n = await transition(tx, {
+          orderId: order.id,
+          orderNo,
+          fromStatus: OrderStatus.PENDING_PAYMENT,
+          toStatus: OrderStatus.CANCELLED,
+          operatorType: OperatorType.SYSTEM,
+          operatorId: 0n,
+          reason: CancelReason.TIMEOUT,
+          extraData: { cancelReason: CancelReason.TIMEOUT, cancelledAt: new Date() },
+        });
+        if (n === 0) {
+          return 0;
+        }
+        await this.releaseFrozenStock(tx, order.id, orderNo, OperatorType.SYSTEM, 0n, CancelReason.TIMEOUT);
+        await this.closePendingPayments(tx, order.id);
+        return n;
+      },
+      { label: 'order.closeTimeout' },
+    );
+
+    return { skipped: affected === 0 };
+  }
+
+  /**
+   * 用户取消「待支付」订单（F8 路径 1）。
+   *
+   * @description 越权防护：查询 `where` 必须带 `userId`，越权或缺单统一返回 31001（不暴露订单是否存在）。
+   * 本期仅允许 `PENDING_PAYMENT` 取消——已支付取消必须走退款流程（F9），留待后续任务。
+   * @param userId 用户 ID（只从 `req.auth` 取，绝不从 body 读）
+   * @param orderNo 订单号
+   * @param reason 取消原因（可空）
+   * @throws {BusinessError} 31001 订单不存在/不属于该用户；31002 状态不允许取消
+   */
+  async cancelByUser(userId: bigint, orderNo: string, reason?: string | null): Promise<void> {
+    await this.cancel({
+      orderNo,
+      requireUserId: userId,
+      operatorType: OperatorType.USER,
+      operatorId: userId,
+      cancelReason: CancelReason.USER_CANCEL,
+      reason,
+    });
+  }
+
+  /**
+   * 管理员取消「待支付」订单（F8 路径 3 的子集）。
+   *
+   * @description 本期仅允许 `PENDING_PAYMENT` 取消（PAID/SHIPPED 取消需触发退款，见 F9，留待后续任务）。
+   * @param adminId 管理员 ID
+   * @param orderNo 订单号
+   * @param reason 取消原因（可空）
+   * @throws {BusinessError} 31001 订单不存在；31002 状态不允许取消
+   */
+  async cancelByAdmin(adminId: bigint, orderNo: string, reason?: string | null): Promise<void> {
+    await this.cancel({
+      orderNo,
+      requireUserId: null,
+      operatorType: OperatorType.ADMIN,
+      operatorId: adminId,
+      cancelReason: CancelReason.ADMIN_CANCEL,
+      reason,
+    });
+  }
+
+  /**
+   * 取消的内部实现（PENDING_PAYMENT → CANCELLED）。
+   *
+   * @description 与 `closeByTimeout` 共用同一套「条件更新 + 释放冻结 + 关闭待支付单」逻辑，
+   * 仅操作人/原因不同。越权防护由 `requireUserId` 决定：`null` 表示不校验归属（管理员）。
+   * @param params 取消参数
+   * @throws {BusinessError} 31001 / 31002
+   */
+  private async cancel(params: {
+    orderNo: string;
+    requireUserId: bigint | null;
+    operatorType: OperatorType;
+    operatorId: bigint;
+    cancelReason: CancelReason;
+    reason?: string | null;
+  }): Promise<void> {
+    const where =
+      params.requireUserId === null
+        ? { orderNo: params.orderNo }
+        : { orderNo: params.orderNo, userId: params.requireUserId };
+
+    const order = await this.prisma.order.findFirst({
+      where,
+      select: { id: true, status: true },
+    });
+    if (order === null) {
+      // 用户路径不暴露订单是否存在（越权防护）；复用 31001
+      throw new BusinessError('订单不存在', { code: ErrorCode.ORDER_NOT_FOUND, httpStatus: 404 });
+    }
+    if (order.status !== OrderStatus.PENDING_PAYMENT) {
+      // 本期仅支持「待支付」取消；已支付取消需走退款（F9），不在本任务范围
+      throw new BusinessError('订单当前状态不允许取消', {
+        code: ErrorCode.ORDER_STATUS_INVALID,
+        httpStatus: 409,
+      });
+    }
+
+    await withTransaction(
+      async (tx) => {
+        const n = await transition(tx, {
+          orderId: order.id,
+          orderNo: params.orderNo,
+          fromStatus: OrderStatus.PENDING_PAYMENT,
+          toStatus: OrderStatus.CANCELLED,
+          operatorType: params.operatorType,
+          operatorId: params.operatorId,
+          reason: params.reason ?? params.cancelReason,
+          extraData: {
+            cancelReason: params.cancelReason,
+            cancelledAt: new Date(),
+          },
+        });
+        if (n === 0) {
+          return; // 并发已变，幂等跳过
+        }
+        await this.releaseFrozenStock(
+          tx,
+          order.id,
+          params.orderNo,
+          params.operatorType,
+          params.operatorId,
+          params.cancelReason,
+        );
+        await this.closePendingPayments(tx, order.id);
+      },
+      { label: 'order.cancel' },
+    );
+  }
+
+  /**
+   * 释放某订单的全部冻结库存（按 sku_id 升序，与冻结顺序一致，防死锁）。
+   *
+   * @param tx 事务客户端
+   * @param orderId 订单主键
+   * @param orderNo 订单号（写入 stock_logs.biz_no）
+   * @param operatorType 操作人类型
+   * @param operatorId 操作人 ID
+   * @param reason 释放原因（TIMEOUT / USER_CANCEL / ADMIN_CANCEL）
+   */
+  private async releaseFrozenStock(
+    tx: Prisma.TransactionClient,
+    orderId: bigint,
+    orderNo: string,
+    operatorType: OperatorType,
+    operatorId: bigint,
+    reason: CancelReason,
+  ): Promise<void> {
+    const items = await tx.orderItem.findMany({
+      where: { orderId },
+      select: { skuId: true, quantity: true },
+      orderBy: { skuId: 'asc' },
+    });
+    for (const it of items) {
+      // eslint-disable-next-line no-await-in-loop -- 必须按 sku_id 升序串行，与冻结顺序一致
+      await this.stockService.release(
+        {
+          skuId: it.skuId,
+          qty: it.quantity,
+          bizNo: orderNo,
+          operatorType,
+          operatorId,
+          reason,
+        },
+        tx,
+      );
+    }
+  }
+
+  /**
+   * 关闭订单关联、仍处待支付的支付单（F10：UPDATE payments SET status='CLOSED'）。
+   *
+   * @description 下单即支付模式下，关单时通常尚无支付单（影响 0 行，幂等无害）；
+   * 若用户已发起支付但未完成，此处将其关闭，渠道侧超时后自动关闭。
+   * @param tx 事务客户端
+   * @param orderId 订单主键
+   */
+  private async closePendingPayments(
+    tx: Prisma.TransactionClient,
+    orderId: bigint,
+  ): Promise<void> {
+    await tx.payment.updateMany({
+      where: { orderId, status: PayStatus.PENDING },
+      data: { status: PayStatus.CLOSED, closedAt: new Date() },
+    });
   }
 
   /**

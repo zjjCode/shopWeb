@@ -73,3 +73,37 @@ export const createOrderSchema = z
 
 /** 下单入参类型 */
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
+
+/**
+ * 取消订单路由参数：POST /api/orders/:orderNo/cancel
+ *
+ * @description 订单号是字符串业务号（如 `NO...`），不做 bigint 转换。
+ */
+export const orderNoParamSchema = z
+  .object({
+    /** 订单号 */
+    orderNo: z.string().min(1, '订单号不能为空'),
+  })
+  .strict();
+
+/** 取消订单路由参数类型 */
+export type OrderNoParam = z.infer<typeof orderNoParamSchema>;
+
+/**
+ * 取消订单入参（body）：POST /api/orders/:orderNo/cancel
+ *
+ * @description 仅收可选取消原因；严格 unknown 字段 400（§7.3）。
+ */
+export const cancelOrderSchema = z
+  .object({
+    /** 取消原因（可空，用于轨迹与售后复盘） */
+    reason: z
+      .string()
+      .trim()
+      .max(255, '取消原因不可超过 255 字')
+      .nullish(),
+  })
+  .strict();
+
+/** 取消订单入参类型 */
+export type CancelOrderInput = z.infer<typeof cancelOrderSchema>;

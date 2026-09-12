@@ -23,6 +23,7 @@ import { closeLogger, logError, logFatal, logInfo, logWarn } from '@/core/logger
 import { connectPrisma, disconnectPrisma } from '@/core/prisma';
 import { closeQueues } from '@/core/queue';
 import { closeRedis } from '@/core/redis';
+import { startScheduler, stopScheduler } from '@/jobs/scheduler';
 import { sleep } from '@/utils/sleep';
 import { createApp } from '@/app';
 
@@ -124,6 +125,7 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
   }
 
   // 先停「生产侧」：不再接新的异步任务，避免关闭过程中又产生新任务
+  await safeClose('scheduler', stopScheduler);
   await safeClose('queue', closeQueues);
   await safeClose('redis', closeRedis);
   await safeClose('prisma', disconnectPrisma);
@@ -208,6 +210,9 @@ export async function bootstrap(): Promise<void> {
   httpServer.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
   httpServer.headersTimeout = HEADERS_TIMEOUT_MS;
   httpServer.requestTimeout = REQUEST_TIMEOUT_MS;
+
+  // 启动异步任务调度器（超时关单 Worker + cron 兜底扫描；测试环境自动跳过）
+  startScheduler();
 
   registerProcessGuards();
 }
