@@ -152,6 +152,8 @@ describe('PaymentService 支付（发起 + 入账事务 B）', () => {
     credit: jest.Mock<AnyAsyncFn>;
     /** 充值入账按 userId 取（首充开户）用户余额账户 */
     getOrCreateAccount: jest.Mock<AnyAsyncFn>;
+    /** 余额支付结转对（F6.6），由 FundService 单测覆盖正确性，此处只验证委托发生 + 入参 + 传 tx */
+    recordBalancePayment: jest.Mock<AnyAsyncFn>;
   };
   /** 被测试对象 */
   let svc: PaymentService;
@@ -176,7 +178,11 @@ describe('PaymentService 支付（发起 + 入账事务 B）', () => {
       rechargeOrder: { updateMany: jest.fn<AnyAsyncFn>() },
     };
     stockService = { confirm: jest.fn<AnyAsyncFn>() };
-    fundService = { credit: jest.fn<AnyAsyncFn>(), getOrCreateAccount: jest.fn<AnyAsyncFn>() };
+    fundService = {
+      credit: jest.fn<AnyAsyncFn>(),
+      getOrCreateAccount: jest.fn<AnyAsyncFn>(),
+      recordBalancePayment: jest.fn<AnyAsyncFn>(),
+    };
 
     // 假 tx 的委托指向同一批假实现，保证「事务内写库」的断言能命中
     FAKE_TX = {
@@ -234,6 +240,11 @@ describe('PaymentService 支付（发起 + 入账事务 B）', () => {
       balance: 0n,
       frozenBalance: 0n,
       version: 0,
+    });
+    // 余额支付结转对（payByBalance 委托；正确性由 fundService.spec 覆盖）
+    fundService.recordBalancePayment.mockResolvedValue({
+      txGroupNo: 'TG-PAY-1',
+      user: {}, platformIn: {}, platformOut: {},
     });
 
     svc = new PaymentService(
@@ -806,5 +817,120 @@ describe('PaymentService 支付（发起 + 入账事务 B）', () => {
     expect(prisma.orderStatusLog.create).not.toHaveBeenCalled();
     // 但库存仍需 confirm：支付单是「本次首次成功」，库存不能再漏
     expect(stockService.confirm).toHaveBeenCalledTimes(1);
+  });
+
+  // --------------------------------------------------------------------------
+  // payByBalance（余额支付同步入口，F6.6 负债结转对）
+  // --------------------------------------------------------------------------
+
+  /** 构造一笔待支付的余额支付单 */
+  const balancePayment = (overrides: Partial<FakePayment> = {}): FakePayment =>
+    makePayment({ channel: PayChannel.BALANCE, status: PayStatus.PENDING, ...overrides });
+
+  it('payByBalance 成功：支付单 PENDING→SUCCESS、委托 FundService 记账（必传 tx）、订单推进 PAID、库存 confirm', async () => {
+    prisma.payment.findUnique.mockResolvedValue(balancePayment());
+
+    await svc.payByBalance('PAY20260907000001999999', 1n);
+
+    // 1) 支付单 PENDING → SUCCESS
+    expect(prisma.payment.updateMany).toHaveBeenCalledTimes(1);
+    const payArg = prisma.payment.updateMany.mock.calls[0]?.[0] as {
+      where: { paymentNo: string; status: string };
+      data: { status: string };
+    };
+    expect(payArg.where.paymentNo).toBe('PAY20260907000001999999');
+    expect(payArg.where.status).toBe(PayStatus.PENDING);
+    expect(payArg.data.status).toBe(PayStatus.SUCCESS);
+
+    // 2) 记账：委托 FundService.recordBalancePayment，入参正确且必传 tx
+    expect(fundService.recordBalancePayment).toHaveBeenCalledTimes(1);
+    const [input, txArg] = fundService.recordBalancePayment.mock.calls[0] as [
+      Record<string, unknown>,
+      unknown,
+    ];
+    expect(input.userId).toBe(1n);
+    expect(input.amount).toBe(12800n);
+    expect(input.orderNo).toBe('SO20260907000001123456');
+    expect(input.paymentNo).toBe('PAY20260907000001999999');
+    expect(input.operatorType).toBe('SYSTEM');
+    expect(input.operatorId).toBe(0n);
+    // 漏传 tx = 记账跑独立连接，事务 B 回滚时退款流水已落库 = 钱凭空多出来
+    expect(txArg).toBe(FAKE_TX);
+
+    // 3) 订单 PENDING_PAYMENT → PAID + 轨迹
+    expect(prisma.order.updateMany).toHaveBeenCalledTimes(1);
+    const orderArg = prisma.order.updateMany.mock.calls[0]?.[0] as {
+      where: { id: bigint; status: string };
+      data: { status: string };
+    };
+    expect(orderArg.where.id).toBe(9001n);
+    expect(orderArg.where.status).toBe(OrderStatus.PENDING_PAYMENT);
+    expect(orderArg.data.status).toBe(OrderStatus.PAID);
+    expect(prisma.orderStatusLog.create).toHaveBeenCalledTimes(1);
+
+    // 4) 库存 frozen → sold
+    expect(stockService.confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it('payByBalance 幂等：重复调用（支付单已是 SUCCESS）→ 静默返回，记账只发生一次', async () => {
+    prisma.payment.findUnique.mockResolvedValue(balancePayment());
+    await svc.payByBalance('PAY20260907000001999999', 1n);
+    expect(fundService.recordBalancePayment).toHaveBeenCalledTimes(1);
+
+    // 第二次：支付单已被置 SUCCESS（事务内条件更新命中过），阶段 1 即返回
+    prisma.payment.findUnique.mockResolvedValue(balancePayment({ status: PayStatus.SUCCESS }));
+    await svc.payByBalance('PAY20260907000001999999', 1n);
+    expect(fundService.recordBalancePayment).toHaveBeenCalledTimes(1);
+    expect(prisma.payment.updateMany).toHaveBeenCalledTimes(1); // 第二次条件更新 count=0 直接返回
+  });
+
+  it('payByBalance 非 BALANCE 支付单 → 抛 40005（误走回调入口的 BALANCE 单不应在此处理）', async () => {
+    // makePayment 默认 channel=MOCK
+    prisma.payment.findUnique.mockResolvedValue(makePayment());
+
+    await expect(svc.payByBalance('PAY20260907000001999999', 1n)).rejects.toMatchObject({
+      code: ErrorCode.PAYMENT_CHANNEL_MISMATCH,
+    });
+    expect(fundService.recordBalancePayment).not.toHaveBeenCalled();
+  });
+
+  it('payByBalance 越权（支付单不属于当前用户）→ 抛 40001，且不记账', async () => {
+    prisma.payment.findUnique.mockResolvedValue(balancePayment({ userId: 2n }));
+
+    await expect(svc.payByBalance('PAY20260907000001999999', 1n)).rejects.toMatchObject({
+      code: ErrorCode.PAYMENT_NOT_FOUND,
+    });
+    expect(fundService.recordBalancePayment).not.toHaveBeenCalled();
+  });
+
+  it('payByBalance 支付单已关闭 → 抛 40003；已 FAILED/REFUNDED → 抛 40004', async () => {
+    prisma.payment.findUnique.mockResolvedValue(balancePayment({ status: PayStatus.CLOSED }));
+    await expect(svc.payByBalance('PAY20260907000001999999', 1n)).rejects.toMatchObject({
+      code: ErrorCode.PAYMENT_CLOSED,
+    });
+
+    for (const status of [PayStatus.FAILED, PayStatus.REFUNDED]) {
+      prisma.payment.findUnique.mockResolvedValue(balancePayment({ status }));
+      await expect(svc.payByBalance('PAY20260907000001999999', 1n)).rejects.toMatchObject({
+        code: ErrorCode.PAYMENT_FINAL_STATE,
+      });
+    }
+    expect(fundService.recordBalancePayment).not.toHaveBeenCalled();
+  });
+
+  it('payByBalance 余额不足（FundService 抛 61002）→ 向上传播，订单不推进（事务 B 整笔回滚）', async () => {
+    prisma.payment.findUnique.mockResolvedValue(balancePayment());
+    fundService.recordBalancePayment.mockRejectedValue(
+      Object.assign(new Error('余额不足'), { code: ErrorCode.BALANCE_NOT_ENOUGH }),
+    );
+
+    await expect(svc.payByBalance('PAY20260907000001999999', 1n)).rejects.toMatchObject({
+      code: ErrorCode.BALANCE_NOT_ENOUGH,
+    });
+
+    // 记账（步骤 2）先于订单推进（步骤 3）；记账失败则订单绝不能推进
+    expect(prisma.order.updateMany).not.toHaveBeenCalled();
+    expect(prisma.orderStatusLog.create).not.toHaveBeenCalled();
+    expect(stockService.confirm).not.toHaveBeenCalled();
   });
 });

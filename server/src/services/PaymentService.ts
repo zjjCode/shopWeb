@@ -28,9 +28,11 @@
  * ⚠️ 本期边界（T060）：
  * - **只实现 MOCK 渠道**：`payUrl` 为前端收银台地址 `/payment/{paymentNo}`。真实渠道由
  *   `PaymentRouter` 按 `payMethod` 分发适配器（F6.5），属下一批任务。
- * - **渠道支付已记账，余额支付未做**：渠道支付（MOCK/ALIPAY/WECHAT）在事务 B 内写
+ * - **渠道支付已记账，余额支付已接入**：渠道支付（MOCK/ALIPAY/WECHAT）在事务 B 内写
  *   `ORDER_PAY` 的 IN 流水（平台现金账户，`is_liability=false`），已随 T061 接入；
- *   余额支付（`channel=BALANCE`）需 `BalanceService`（T070-A），本期留 `TODO(T070)` 不实现。
+ *   余额支付（`channel=BALANCE`）走独立的 {@link PaymentService.payByBalance} 同步入口，
+ *   按 F6.6 负债结转对（USER_BALANCE OUT + PLATFORM 先 IN 后 OUT）记账（结算原语收口在
+ *   `FundService.recordBalancePayment`，本服务只做业务编排）。
  * - **充值入账已接入（T070-C）**：`orderId === null` 的支付单走 {@link PaymentService.settleRecharge}
  *   （F14.1 ② 事务 I）—— 推进充值单 + 同 `tx_group_no` 写两条 IN 流水
  *   `PLATFORM_RECHARGE_IN`（`is_liability=**true**`，平台欠用户）与 `BALANCE_RECHARGE`（用户余额 +）。
@@ -407,6 +409,153 @@ export class PaymentService {
    * @returns void
    * @throws {BusinessError} 平台现金账户不存在（60001）→ 上层事务整体回滚
    */
+  /**
+   * 余额支付（同步扣款，F6.6 负债结转对）。
+   *
+   * @description 余额支付没有渠道异步回调，钱直接来自用户余额，故在用户点击「余额支付」时
+   * **同步**完成：校验 → 事务 B 内推进支付单 / 记账结转对 / 推进订单 / 确认库存。
+   * 与 {@link PaymentService.handlePaidNotify}（渠道支付走异步回调）是两条入口，不能混用：
+   * 余额支付若误走 `handlePaidNotify`，BALANCE 分支只会告警跳过记账、订单却照常推进 ——
+   * 留下「订单已 PAID、平台账上却没记这笔负债结转」的资损脏账。
+   *
+   * 三条铁律（与渠道支付同源）：
+   * 1. **必须与调用方共用同一个 `tx`**：`FundService.recordBalancePayment` 漏传 tx 会让记账跑独立连接，
+   *    事务 B 回滚时结算流水已落库 —— **钱凭空多出来**。
+   * 2. **记账必须排在订单推进与库存 confirm 之前**：记账失败要整笔回滚，
+   *    绝不留下「订单已 PAID 但没记负债结转」的脏账。
+   * 3. **状态推进一律条件更新**（`WHERE status='PENDING'`），`count=0` 即判定并发 / 重复，
+   *    整笔回滚，**绝不带病继续**。
+   *
+   * 幂等：支付单已 SUCCESS → 直接返回（第一重）；事务内 `updateMany` count=0 → 返回（第二重）。
+   * 余额不足由 `FundService` 抛 `BALANCE_NOT_ENOUGH`，向上传播 → 整事务回滚。
+   *
+   * @param paymentNo 支付单号（由 `createPayment(payMethod=BALANCE)` 创建）
+   * @param userId 当前登录用户（只从 auth 取，越权兜底按「不存在」处理）
+   * @returns void
+   * @throws {NotFoundError} 支付单不存在（40001）/ 不属于该用户（按不存在处理）
+   * @throws {BusinessError} 非余额支付单（40005）、支付单已关闭（40003）、已处终态（40004）
+   * @throws {BusinessError} 余额不足（61002）→ 整事务回滚
+   */
+  async payByBalance(paymentNo: string, userId: bigint): Promise<void> {
+    // ---------- 阶段 1：事务外只读校验（失败无副作用）----------
+    const payment = await this.prisma.payment.findUnique({ where: { paymentNo } });
+    if (payment === null) {
+      throw new NotFoundError('支付单不存在', { code: ErrorCode.PAYMENT_NOT_FOUND });
+    }
+    // 越权兜底：查询带 userId，不存在即按「不存在」处理（不泄露支付单是否存在）
+    if (payment.userId !== userId) {
+      throw new NotFoundError('支付单不存在', { code: ErrorCode.PAYMENT_NOT_FOUND });
+    }
+    // 余额支付只走本入口，误走回调入口的 BALANCE 单不应在此处理
+    if (payment.channel !== PayChannel.BALANCE) {
+      throw new BusinessError('该支付单非余额支付，请使用对应渠道支付', {
+        code: ErrorCode.PAYMENT_CHANNEL_MISMATCH,
+      });
+    }
+    // 余额支付仅服务订单支付；充值单走充值入账（T070-C），不会以 BALANCE 渠道发起
+    if (payment.orderId === null) {
+      throw new BusinessError('余额支付仅支持订单支付', { code: ErrorCode.PAYMENT_CHANNEL_MISMATCH });
+    }
+    // 固化非空 orderId：闭包内 TS 不会保留属性收窄，下面的事务 B 内统一用此局部 const
+    const orderId = payment.orderId;
+    // 终态拦截（与 handlePaidNotify 同口径，避免被 WHERE status='PENDING' 静默吞掉迟到的重复请求）
+    if (payment.status === PayStatus.SUCCESS) {
+      return; // 幂等第一重：正常重复请求，静默返回
+    }
+    if (payment.status === PayStatus.CLOSED) {
+      throw new ConflictError('支付单已关闭', { code: ErrorCode.PAYMENT_CLOSED });
+    }
+    if (payment.status === PayStatus.FAILED || payment.status === PayStatus.REFUNDED) {
+      throw new ConflictError('支付单已处终态，不可支付', { code: ErrorCode.PAYMENT_FINAL_STATE });
+    }
+
+    // 复验订单仍可支付（用户可能拖到超时）：放到事务外，提前失败不持锁
+    await this.loadPayableOrder(userId, payment.orderNo ?? payment.bizNo);
+
+    // ---------- 阶段 2：事务 B ----------
+    await withTransaction(
+      async (tx) => {
+        // 1) 支付单 PENDING → SUCCESS（条件更新即幂等第二重）
+        const paidAt = new Date();
+        const updated = await tx.payment.updateMany({
+          where: { paymentNo, status: PayStatus.PENDING },
+          data: {
+            status: PayStatus.SUCCESS,
+            channelTradeNo: `BALANCE-${paymentNo}`,
+            paidAt,
+            notifyCount: { increment: 1 },
+            lastNotifyAt: paidAt,
+          },
+        });
+        if (updated.count === 0) {
+          return; // 并发 / 重复：整笔回滚
+        }
+
+        const orderNo = payment.orderNo ?? payment.bizNo;
+
+        // 2) 记账：余额支付结转对（F6.6）—— 必须在订单推进前，失败整笔回滚
+        await this.fundService.recordBalancePayment(
+          {
+            userId,
+            amount: payment.amount,
+            orderNo,
+            paymentNo,
+            operatorType: OperatorType.SYSTEM,
+            operatorId: 0n,
+          },
+          tx,
+        );
+
+        // 3) 订单 PENDING_PAYMENT → PAID
+        const advanced = await tx.order.updateMany({
+          where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
+          data: {
+            status: OrderStatus.PAID,
+            payMethod: payment.channel,
+            paidAt,
+            version: { increment: 1 },
+          },
+        });
+        if (advanced.count > 0) {
+          await tx.orderStatusLog.create({
+            data: {
+              orderId,
+              orderNo,
+              fromStatus: OrderStatus.PENDING_PAYMENT,
+              toStatus: OrderStatus.PAID,
+              operatorType: OperatorType.SYSTEM,
+              operatorId: 0n,
+              reason: '余额支付成功',
+              extra: { paymentNo, channel: 'BALANCE' },
+            },
+          });
+        }
+
+        // 4) 库存 frozen → sold（必须传 tx，否则失败时库存回不去）
+        const items = await tx.orderItem.findMany({
+          where: { orderId },
+          select: ORDER_ITEM_SELECT,
+        });
+        const orderedItems = this.sortBySkuId(items as OrderItemRow[]);
+        for (const item of orderedItems) {
+          // eslint-disable-next-line no-await-in-loop -- 顺序敏感：必须按 sku_id 升序串行，并行会破坏加锁顺序
+          await this.stockService.confirm(
+            {
+              skuId: item.skuId,
+              qty: item.quantity,
+              bizNo: orderNo,
+              operatorType: OperatorType.SYSTEM,
+              operatorId: 0n,
+              idempotencyKey: null,
+            },
+            tx,
+          );
+        }
+      },
+      { label: 'payment.balance_pay' },
+    );
+  }
+
   private async recordFundInflow(payment: PaidPayment, orderNo: string, tx: TxClient): Promise<void> {
     // 充值场景（`orderId` 为 NULL，钱挂充值单而非订单）：口径与订单支付完全不同，
     // 记成 ORDER_PAY 会虚增平台收入 + 漏记负债，且无任何报错。
@@ -422,11 +571,9 @@ export class PaymentService {
       return;
     }
 
-    // 余额支付本期不做：需要 BalanceService 扣 USER_BALANCE（T070-A），现在没有余额账户可扣。
-    // TODO(T070)：余额支付走 F6.6 的结转对 —— 同一 tx_group_no 下三条流水，**先 IN 后 OUT**：
-    //   USER_BALANCE OUT(BALANCE_CONSUME) → PLATFORM IN(LIABILITY_SETTLE_IN)
-    //   → PLATFORM OUT(LIABILITY_SETTLE_OUT，is_liability=true)
-    //   顺序不可颠倒，否则平台余额不足时会触发 CHECK(balance >= 0) 直接打失败整笔支付。
+    // 余额支付已通过 `payByBalance`（F6.6 结转对）实现，走独立同步入口，不会进入本异步回调路径；
+    // 此处仅作纵深防御：若某调用方绕开 payByBalance、直接对 BALANCE 支付单发起回调，
+    // 命中即告警并跳过记账（余额支付的正确入口是 payByBalance，那里才扣用户余额）。
     if (payment.channel === PayChannel.BALANCE) {
       logWarn('payment.balance_channel_not_supported', {
         bizNos: { paymentNo: payment.paymentNo, orderNo },

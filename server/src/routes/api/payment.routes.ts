@@ -81,6 +81,15 @@ export function createPaymentRouter(): Router {
     );
   }
 
+  // 余额支付（同步扣款，F6.6 负债结转对）：真实功能，全环境注册（不依赖任何外部渠道）
+  router.post(
+    '/payments/:paymentNo/balance-pay',
+    auth({ scope: 'shop' }),
+    payCreateRateLimit(),
+    validate({ params: paymentNoParamSchema }),
+    asyncHandler(paymentController.balancePay),
+  );
+
   return router;
 }
 

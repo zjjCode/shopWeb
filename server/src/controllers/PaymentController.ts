@@ -97,6 +97,25 @@ export class PaymentController {
 
     sendOk(res, { paymentNo });
   }
+
+  /**
+   * 余额支付（同步扣款，F6.6 负债结转对）。
+   *
+   * @description 余额支付没有渠道异步回调，用户点击「余额支付」时同步完成扣款 + 记账 + 推进订单。
+   * 仅 `auth({ scope: 'shop' })` 用户可调，`userId` 只从 `req.auth` 取（绝不从入参读）。
+   * @param req Express 请求（params.paymentNo 已由 validate 校验）
+   * @param res Express 响应
+   * @returns void
+   * @throws {NotFoundError} 支付单不存在（40001）
+   * @throws {BusinessError} 非余额支付单（40005）、余额不足（61002）
+   */
+  async balancePay(req: Request, res: Response): Promise<void> {
+    const { paymentNo } = req.params as unknown as PaymentNoParam;
+
+    await paymentService.payByBalance(paymentNo, currentUserId(req));
+
+    sendOk(res, { paymentNo });
+  }
 }
 
 /** 默认单例 */

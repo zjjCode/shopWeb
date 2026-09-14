@@ -72,10 +72,9 @@
  */
 
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { AccountStatus, FundAccountType, FundDirection } from '@/constants/enums';
-// FundBizType / OperatorType 仅作类型使用：走 `import type` 避免打包进运行时，
-// 也满足 lint 的 consistent-type-imports
-import type { FundBizType, OperatorType } from '@/constants/enums';
+import { AccountStatus, FundAccountType, FundBizType, FundDirection } from '@/constants/enums';
+// OperatorType 仅作类型使用：走 `import type` 避免打包进运行时，也满足 lint 的 consistent-type-imports
+import type { OperatorType } from '@/constants/enums';
 import { BusinessError, NotFoundError, ValidationError } from '@/core/errors';
 import { ErrorCode } from '@/core/errors/errorCodes';
 import {
@@ -228,6 +227,18 @@ export interface TransferResult {
   txGroupNo: string;
 }
 
+/** 负债结转对结算结果（三条流水共享同一 `txGroupNo`，见 {@link FundService.doSettleLiability}） */
+export interface SettleResult {
+  /** 交易组号 */
+  txGroupNo: string;
+  /** 用户侧流水结果（余额支付 OUT / 退款 IN） */
+  user: FundResult;
+  /** 平台侧结转 IN 流水结果（先写） */
+  platformIn: FundResult;
+  /** 平台侧结转 OUT 流水结果（后写） */
+  platformOut: FundResult;
+}
+
 /** `SELECT ... FOR UPDATE` 返回的原始行（列名是 snake_case，与 @map 后的 DB 列一致） */
 interface LockRow {
   id: bigint | number;
@@ -345,7 +356,7 @@ export class FundService {
   async getOrCreateAccount(
     userId: bigint,
     accountType: FundAccountType = FundAccountType.USER_BALANCE,
-    tx?: TxClient,
+    tx?: DbClient,
   ): Promise<FundAccountSnapshot> {
     const client = this.resolveClient(tx);
 
@@ -401,7 +412,7 @@ export class FundService {
    * @param tx 事务客户端（可空）
    * @returns 实际执行写操作的客户端
    */
-  private resolveClient(tx?: TxClient): DbClient {
+  private resolveClient(tx?: TxClient | DbClient): DbClient {
     return (tx ?? this.prisma) as DbClient;
   }
 
@@ -622,23 +633,329 @@ export class FundService {
   }
 
   /**
-   * 按 `id` 升序依次锁定多个账户（防死锁）。
+   * 按 `id` 升序依次锁定多个账户（防死锁），返回「账户 ID → 快照」映射。
    *
-   * @description 转账涉及两个账户，若两个方向的转账各自按不同顺序加锁，
+   * @description 转账 / 负债结转对涉及两个账户，若两个方向的操各自按不同顺序加锁，
    * 就会形成「A 等 B、B 等 A」的死锁环。固定按 `id` 升序加锁是标准的破环手段。
    * 注：`docs/04-flows.md` F6.6 铁律 4 描述的是「先 USER_BALANCE 后 PLATFORM_CASH」这一**具体场景**下的顺序，
    * 本方法采用更通用的 id 升序规则，覆盖任意两账户组合。
+   * 返回映射而非数组：调用方传入的账户 ID 顺序不一定等于加锁顺序，用 ID 取快照最稳。
    *
    * @param client 客户端
    * @param accountIds 账户 ID 列表
-   * @returns void
+   * @returns 账户 ID → 快照 的 Map（已按 id 升序串行加锁）
    */
-  private async lockAccountsInOrder(client: DbClient, accountIds: readonly bigint[]): Promise<void> {
-    const ordered = [...accountIds].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  private async lockAccountsInOrder(
+    client: DbClient,
+    accountIds: readonly bigint[],
+  ): Promise<Map<bigint, FundAccountSnapshot>> {
+    const ordered = [...new Set(accountIds)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const map = new Map<bigint, FundAccountSnapshot>();
     for (const accountId of ordered) {
       // eslint-disable-next-line no-await-in-loop -- 顺序敏感：必须按 id 升序串行加锁，并行会破坏加锁顺序
-      await this.lockAccount(client, accountId);
+      map.set(accountId, await this.lockAccount(client, accountId));
     }
+    return map;
+  }
+
+  /**
+   * 负债结转对结算（F6.6 支付 / F9.3 退款共用原语）。
+   *
+   * @description 余额支付与余额退款在账面上互为反向，但骨架完全一致：都是「用户余额账户一条流水」
+   * +「平台现金账户一对结转流水（先 IN 后 OUT）」，三条流水共享同一 `txGroupNo`。
+   * 把这套最易错（方向 / isLiability 取反 / 先 IN 后 OUT 顺序）的逻辑收口到一处，
+   * 支付侧 {@link FundService.recordBalancePayment} 与退款侧 {@link FundService.recordBalanceRefund} 只做配置。
+   *
+   * 三条铁律（违反任一都是资损且**无报错**）：
+   * 1. **先 IN 后 OUT**（平台这对）：先写 `LIABILITY_SETTLE_IN`（平台余额 +N），再写 `LIABILITY_SETTLE_OUT`
+   *    （平台余额 −N）。中间态恒为 +N，不会触发平台 `CHECK(balance >= 0)`；反之若平台余额 < N 时先 OUT 会直接打失败整笔。
+   * 2. **`isLiability` 由调用方按口径传入**：支付口径（`recordBalancePayment`）IN→false / OUT→true；
+   *    退款是**反向结转**（F9.3，注意取反）IN→true / OUT→false。填反了的表现是「负债总额算错但没有任何报错」。
+   * 3. **用户流水在平台这对之前写**：用户余额账户与平台现金账户是两个不同账户，先锁/先写哪一侧不影响一致性，
+   *    但用户侧余额不足必须**最先**抛错——否则平台流水已写而用户余额未扣，账目裂开。
+   *
+   * 防超扣：用户侧 OUT 走条件更新 `balance >= amount`；平台侧 OUT 在 IN（已 +N）之后再走 `balance >= amount`，
+   * 此时余额 = before+N（before≥0）必然 ≥ N，绝不会误判。
+   *
+   * 幂等：三条流水的 `idempotencyKey` 统一为业务单号（paymentNo / refundNo），复合唯一键
+   * `(biz_type, idempotency_key)` 因 `bizType` 各异不会互撞。真正的重入闸门是调用方事务的
+   * 条件更新（payment/refund 单 `WHERE status=?`），故本方法不处理 P2002（撞键即说明原子事务被重放，交给外层回滚）。
+   *
+   * @param client 事务客户端（**必须**在调用方事务内，否则回滚时账已记、钱凭空多）
+   * @param cfg 结算配置（账户 ID / 金额 / 业务单号 / 各侧 bizType 与 isLiability / 操作人）
+   * @returns 结算结果（txGroupNo + 三条流水结果）
+   * @throws {BusinessError} 用户余额不足（61002）→ 整笔回滚
+   */
+  private async doSettleLiability(
+    client: DbClient,
+    cfg: {
+      userAccountId: bigint;
+      platformAccountId: bigint;
+      amount: bigint;
+      orderNo: string;
+      bizNo: string;
+      idempotencyKey: string;
+      userBizType: FundBizType;
+      userDirection: FundDirection;
+      settleInLiability: boolean;
+      settleOutLiability: boolean;
+      operatorType: OperatorType;
+      operatorId: bigint;
+      operatorName?: string | null;
+      remark?: string | null;
+      txGroupNo: string;
+      /** 业务单号透传：支付单号 / 退款单号（仅其一有值），落到三条流水的 paymentNo / refundNo 便于对账追踪 */
+      paymentNo?: string | null;
+      refundNo?: string | null;
+    },
+  ): Promise<SettleResult> {
+    const amount = MoneyUtil.toBigint(cfg.amount, 'amount');
+    if (amount <= 0n) {
+      throw new ValidationError('结算金额必须大于 0', { code: ErrorCode.FIELD_FORMAT_INVALID });
+    }
+    if (cfg.userAccountId === cfg.platformAccountId) {
+      throw new ValidationError('结算的收付账户不能相同', { code: ErrorCode.FIELD_FORMAT_INVALID });
+    }
+
+    // 按 id 升序加锁（防死锁），拿到两侧快照
+    const locked = await this.lockAccountsInOrder(client, [
+      cfg.userAccountId,
+      cfg.platformAccountId,
+    ]);
+    const userSnap = locked.get(cfg.userAccountId);
+    const platSnap = locked.get(cfg.platformAccountId);
+    if (userSnap === undefined || platSnap === undefined) {
+      throw new NotFoundError('结算账户不存在', { code: ErrorCode.BALANCE_ACCOUNT_NOT_FOUND });
+    }
+    this.assertActive(userSnap);
+    this.assertActive(platSnap);
+
+    // 用户侧余额变动（OUT 减 / IN 加），不足立即抛错（先于平台流水，避免账目裂开）
+    const userBefore = userSnap.balance;
+    const userAfter =
+      cfg.userDirection === FundDirection.IN ? userBefore + amount : userBefore - amount;
+    if (userAfter < 0n) {
+      throw new BusinessError('余额不足', { code: ErrorCode.BALANCE_NOT_ENOUGH });
+    }
+
+    // 平台侧一对结转：IN 后 OUT，净额为 0（IN 后余额 = before+N，OUT 后 = before）
+    const platBefore = platSnap.balance;
+    const platAfterIn = platBefore + amount;
+
+    // 公共字段
+    const common = {
+      amount,
+      txGroupNo: cfg.txGroupNo,
+      orderNo: cfg.orderNo,
+      paymentNo: cfg.paymentNo ?? null,
+      refundNo: cfg.refundNo ?? null,
+      idempotencyKey: cfg.idempotencyKey,
+      operatorType: cfg.operatorType,
+      operatorId: cfg.operatorId,
+      operatorName: cfg.operatorName ?? null,
+      remark: cfg.remark ?? null,
+    };
+
+    // ① 用户侧流水（BALANCE_CONSUME 支付 / BALANCE_REFUND 退款）：恒 false，不参与平台负债口径
+    const userResult = await this.doPost(
+      client,
+      {
+        ...common,
+        accountId: cfg.userAccountId,
+        bizType: cfg.userBizType,
+        isLiability: false,
+        counterpartyAccountId: cfg.platformAccountId,
+        counterpartyAccountNo: platSnap.accountNo,
+      },
+      cfg.userDirection,
+    );
+
+    // ② 平台侧 IN：负债转收入（支付）/ 负债增（退款反向结转），先写（中间态 +N 安全）
+    const platInResult = await this.doPost(
+      client,
+      {
+        ...common,
+        accountId: cfg.platformAccountId,
+        bizType: FundBizType.LIABILITY_SETTLE_IN,
+        isLiability: cfg.settleInLiability,
+        counterpartyAccountId: cfg.userAccountId,
+        counterpartyAccountNo: userSnap.accountNo,
+      },
+      FundDirection.IN,
+    );
+
+    // ③ 平台侧 OUT：冲减负债（支付）/ 收入减（退款反向结转），后写
+    const platOutResult = await this.doPost(
+      client,
+      {
+        ...common,
+        accountId: cfg.platformAccountId,
+        bizType: FundBizType.LIABILITY_SETTLE_OUT,
+        isLiability: cfg.settleOutLiability,
+        counterpartyAccountId: cfg.userAccountId,
+        counterpartyAccountNo: userSnap.accountNo,
+      },
+      FundDirection.OUT,
+    );
+
+    // 防超扣兜底校验：用户 OUT 时 doPost 内部条件更新已拦，但仍确认（IN 侧不会失败）；
+    // 平台 OUT 在 IN 之后，余额 = platBefore+amount ≥ amount（platBefore≥0），亦不会失败。
+    // 若极端情况下用户 OUT 的 count=0（并发把余额改小），doPost 已抛 BALANCE_NOT_ENOUGH。
+    void platAfterIn;
+
+    return {
+      txGroupNo: cfg.txGroupNo,
+      user: userResult,
+      platformIn: platInResult,
+      platformOut: platOutResult,
+    };
+  }
+
+  /**
+   * 余额支付结算（F6.6 负债结转对）。
+   *
+   * @description 用户用余额支付时**没有任何现金进入平台账户**（钱在充值时已进账，那时是负债），
+   * 必须在账上写结转对体现「卖出货 = 收入」。三条流水同 `txGroupNo`：
+   *
+   * | # | 账户            | bizType               | 方向 | isLiability | 含义              |
+   * |---|-----------------|-----------------------|------|-------------|-------------------|
+   * | ① | USER_BALANCE    | `BALANCE_CONSUME`     | OUT  | false       | 用户余额扣减      |
+   * | ② | PLATFORM_CASH   | `LIABILITY_SETTLE_IN` | IN   | **false**   | 负债转收入（+N）  |
+   * | ③ | PLATFORM_CASH   | `LIABILITY_SETTLE_OUT`| OUT  | **true**    | 冲减负债（−N）    |
+   *
+   * 收入恒等式：L3 = Σ PLATFORM 流水中 is_liability=false 的净额 = 用户消费的 200 元（本例）。
+   *
+   * 平台现金账户**必须查出来用、不存在即抛错，绝不自动创建**（种子数据预置）；用户余额账户走
+   * `getOrCreateAccount`（首用余额支付的用户此前可能没开户）。账户 ID 解析后传入 {@link FundService.doSettleLiability}。
+   *
+   * @param input 余额支付结算入参（userId / amount / orderNo / paymentNo / 操作人，可选 txGroupNo / tx）
+   * @param tx 事务客户端（**强烈建议传入**：与 PaymentService 事务 B' 同事务回滚，漏传则自开事务）
+   * @returns 结算结果（txGroupNo + 三条流水）
+   * @throws {BusinessError} 用户余额不足（61002）/ 平台现金账户不存在（60001）
+   */
+  async recordBalancePayment(
+    input: {
+      userId: bigint;
+      amount: bigint;
+      orderNo: string;
+      paymentNo: string;
+      operatorType: OperatorType;
+      operatorId: bigint;
+      operatorName?: string | null;
+      remark?: string | null;
+      txGroupNo?: string;
+      tx?: TxClient;
+    },
+    tx?: TxClient,
+  ): Promise<SettleResult> {
+    const run = async (client: DbClient) => {
+      const userAccount = await this.getOrCreateAccount(
+        input.userId,
+        FundAccountType.USER_BALANCE,
+        client,
+      );
+      const platformAccount = await client.fundAccount.findFirst({
+        where: { accountType: FundAccountType.PLATFORM_CASH },
+        select: { id: true, accountNo: true },
+      });
+      if (platformAccount === null) {
+        throw new BusinessError('平台现金账户不存在，拒绝记账', {
+          code: ErrorCode.FUND_RECORD_FAILED,
+        });
+      }
+      return this.doSettleLiability(client, {
+        userAccountId: userAccount.id,
+        platformAccountId: platformAccount.id,
+        amount: input.amount,
+        orderNo: input.orderNo,
+        bizNo: input.paymentNo,
+        idempotencyKey: input.paymentNo,
+        paymentNo: input.paymentNo,
+        refundNo: null,
+        userBizType: FundBizType.BALANCE_CONSUME,
+        userDirection: FundDirection.OUT,
+        settleInLiability: false,
+        settleOutLiability: true,
+        operatorType: input.operatorType,
+        operatorId: input.operatorId,
+        operatorName: input.operatorName ?? null,
+        remark: input.remark ?? `余额支付 ${input.paymentNo}`,
+        txGroupNo: input.txGroupNo ?? generateTxGroupNo(),
+      });
+    };
+    if (tx !== undefined) {
+      return run(this.resolveClient(tx));
+    }
+    return withTransaction((t) => run(this.resolveClient(t)), { label: 'fund.balance_pay' });
+  }
+
+  /**
+   * 余额退款结算（F9.3 反向结转对）。
+   *
+   * @description 退款是支付的**反向**：用户余额账户 IN（BALANCE_REFUND，恒 false）+ 平台一对结转
+   * **取值取反**（与支付口径相反）：② `LIABILITY_SETTLE_IN` → **true**（负债增）先写；
+   * ③ `LIABILITY_SETTLE_OUT` → **false**（收入减）后写。照抄 schema 注释的支付口径会把负债方向记反
+   * （负债总额算错但无报错）。其余与 {@link FundService.recordBalancePayment} 同构。
+   *
+   * @param input 余额退款结算入参（userId / amount / orderNo / refundNo / 操作人，可选 txGroupNo / tx）
+   * @param tx 事务客户端（**必须传入**：与 RefundService 事务 C 同事务回滚）
+   * @returns 结算结果（txGroupNo + 三条流水）
+   * @throws {BusinessError} 用户余额不足（61002，理论上退款 IN 不会触发）/ 平台现金账户不存在（60001）
+   */
+  async recordBalanceRefund(
+    input: {
+      userId: bigint;
+      amount: bigint;
+      orderNo: string;
+      refundNo: string;
+      operatorType: OperatorType;
+      operatorId: bigint;
+      operatorName?: string | null;
+      remark?: string | null;
+      txGroupNo?: string;
+      tx?: TxClient;
+    },
+    tx?: TxClient,
+  ): Promise<SettleResult> {
+    const run = async (client: DbClient) => {
+      const userAccount = await this.getOrCreateAccount(
+        input.userId,
+        FundAccountType.USER_BALANCE,
+        client,
+      );
+      const platformAccount = await client.fundAccount.findFirst({
+        where: { accountType: FundAccountType.PLATFORM_CASH },
+        select: { id: true, accountNo: true },
+      });
+      if (platformAccount === null) {
+        throw new BusinessError('平台现金账户不存在，拒绝记账', {
+          code: ErrorCode.FUND_RECORD_FAILED,
+        });
+      }
+      return this.doSettleLiability(client, {
+        userAccountId: userAccount.id,
+        platformAccountId: platformAccount.id,
+        amount: input.amount,
+        orderNo: input.orderNo,
+        bizNo: input.refundNo,
+        idempotencyKey: input.refundNo,
+        paymentNo: null,
+        refundNo: input.refundNo,
+        userBizType: FundBizType.BALANCE_REFUND,
+        userDirection: FundDirection.IN,
+        settleInLiability: true,
+        settleOutLiability: false,
+        operatorType: input.operatorType,
+        operatorId: input.operatorId,
+        operatorName: input.operatorName ?? null,
+        remark: input.remark ?? `余额退款 ${input.refundNo}`,
+        txGroupNo: input.txGroupNo ?? generateTxGroupNo(),
+      });
+    };
+    if (tx !== undefined) {
+      return run(this.resolveClient(tx));
+    }
+    return withTransaction((t) => run(this.resolveClient(t)), { label: 'fund.balance_refund' });
   }
 
   /**

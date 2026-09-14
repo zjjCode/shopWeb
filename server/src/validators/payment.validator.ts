@@ -8,9 +8,10 @@
  * @created 2026-09-08
  *
  * 校验边界：
- * - `payMethod` **本期只允许 `MOCK`**：真实渠道（ALIPAY / WECHAT / BANKCARD）要等 T061 的
- *   `PaymentRouter` 与适配器就绪。现在放开会让用户在收银台选了支付宝却拿到 mock 的支付页，
- *   属于「看起来能用、实际是假的」的坑，不如直接挡掉。
+ * - `payMethod` 允许 `MOCK` 与 `BALANCE`：`MOCK` 为本地联调/演示渠道；`BALANCE` 为余额支付
+ *   （同步扣款，走 {@link PaymentService.payByBalance}，无外部渠道回调）。真实三方渠道
+ *   （ALIPAY / WECHAT / BANKCARD）要等 T061 的 `PaymentRouter` 与适配器就绪再放开，
+ *   现在放开会让用户在收银台选了支付宝却拿到 mock 的支付页，属于「看起来能用、实际是假的」的坑。
  * - 发起支付**绝不接收 `amount`**：应付金额由服务端按订单 `payAmount` 定（与下单同一条红线）。
  * - mock 确认端点的 `amount` 是**模拟渠道回调携带的金额**，不是「用户想付多少」——
  *   `PaymentService.handlePaidNotify` 会与支付单金额做**严格相等**校验，不符即抛 40002。
@@ -52,10 +53,13 @@ export const createPaymentSchema = z
       .min(1, '订单号不能为空')
       .max(MAX_NO_LEN, `订单号长度不可超过 ${MAX_NO_LEN}`),
     /**
-     * 支付方式。**本期仅 MOCK 可用**（真实渠道待 T061 的 PaymentRouter 接入）。
-     * 放开时把这里改成 `z.nativeEnum(PayChannel)` 即可。
+     * 支付方式。**本期仅 MOCK / BALANCE 可用**：MOCK 为联调渠道，BALANCE 为余额支付
+     * （同步扣款、无外部回调）。真实三方渠道（ALIPAY / WECHAT / BANKCARD）待 T061 的
+     * `PaymentRouter` 接入后放开。
      */
-    payMethod: z.enum(['MOCK'], { errorMap: () => ({ message: '本期仅支持 MOCK 支付方式' }) }),
+    payMethod: z.enum(['MOCK', 'BALANCE'], {
+      errorMap: () => ({ message: '本期仅支持 MOCK / 余额支付' }),
+    }),
   })
   .strict();
 

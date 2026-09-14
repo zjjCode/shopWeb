@@ -1,6 +1,6 @@
 /**
  * @file server/src/tests/unit/refundService.spec.ts
- * @description 退款领域层（T080-A）单元测试：apply 拒收路径、audit 双分支、execute 事务 C 与三条流水记账
+ * @description 退款领域层（T080-A）单元测试：apply 拒收路径、audit 双分支、execute 事务 C 与委托 FundService.recordBalanceRefund 记账
  * @module tests/unit
  * @see server/src/services/RefundService.ts、docs/04-flows.md F9.1 ④ / F9.3（1171 行反向结转对）
  * @author 软件开发团队
@@ -17,8 +17,9 @@
  * 1. `apply` 六条拒收路径 + 成功建单（`refundNo` 由 `IdGenerator` 生成、`status=PENDING`、
  *    `refundTo` 由 `payMethod` 正确映射）；
  * 2. `audit` 驳回 / 同意 / 不存在 / 非 PENDING / 并发 `count=0`；
- * 3. `execute` BALANCE 三条流水：金额一致、调用顺序、`isLiability` 取值（尤其反向结转对）、
- *    同一 `txGroupNo`、counterparty 互指、`(bizType, idempotencyKey)` 组合互不相同；
+ * 3. `execute` BALANCE 记账：委托 fundService.recordBalanceRefund 一次、入参正确（userId/amount/
+ *    orderNo/refundNo/操作人 SYSTEM、且必传 tx）；三条流水的 bizType/isLiability/顺序/txGroupNo/
+ *    counterparty 互指由 fundService.spec.ts 的 recordBalanceRefund 用例穷尽覆盖；
  * 4. `execute` 全部写操作走 tx，外部单例零调用；
  * 5. `execute` 退款单并发（`count=0`）→ 不推进订单、不记账；
  * 6. `execute` CHANNEL → 抛 41004 且不记账、订单状态不变；
@@ -74,20 +75,6 @@ jest.mock('@/core/idGenerator', () => {
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type AnyAsyncFn = (...args: any[]) => Promise<any>;
 /* eslint-enable @typescript-eslint/no-explicit-any */
-
-/** 记账入参（断言用，只取关心的字段） */
-type FundPost = {
-  accountId: bigint;
-  amount: bigint;
-  bizType: string;
-  isLiability?: boolean;
-  counterpartyAccountId?: bigint | null;
-  counterpartyAccountNo?: string | null;
-  txGroupNo?: string | null;
-  idempotencyKey?: string | null;
-  orderNo?: string | null;
-  refundNo?: string | null;
-};
 
 /** 固定退款单号（`IdGenerator.refundNo` 的桩返回值） */
 const REFUND_NO = 'SR20260910000000000001';
@@ -157,9 +144,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
   };
   let stockService: { refundReturn: jest.Mock<AnyAsyncFn> };
   let fundService: {
-    credit: jest.Mock<AnyAsyncFn>;
-    debit: jest.Mock<AnyAsyncFn>;
-    getOrCreateAccount: jest.Mock<AnyAsyncFn>;
+    recordBalanceRefund: jest.Mock<AnyAsyncFn>;
   };
   let svc: RefundService;
 
@@ -195,9 +180,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
     };
     stockService = { refundReturn: jest.fn<AnyAsyncFn>() };
     fundService = {
-      credit: jest.fn<AnyAsyncFn>(),
-      debit: jest.fn<AnyAsyncFn>(),
-      getOrCreateAccount: jest.fn<AnyAsyncFn>(),
+      recordBalanceRefund: jest.fn<AnyAsyncFn>(),
     };
 
     (withTransaction as unknown as jest.Mock<AnyAsyncFn>).mockImplementation(
@@ -240,17 +223,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
     TX.fundAccount.findFirst.mockResolvedValue({ id: 3001n, accountNo: 'ACC_PLATFORM_CASH' });
 
     stockService.refundReturn.mockResolvedValue({ skuId: 101n });
-    fundService.getOrCreateAccount.mockResolvedValue({
-      id: 3002n,
-      accountNo: 'ACC_USER_BALANCE_7',
-      accountType: 'USER_BALANCE',
-      status: 'ACTIVE',
-      balance: 0n,
-      frozenBalance: 0n,
-      version: 0,
-    });
-    fundService.credit.mockResolvedValue({ txNo: 'FT-1', duplicated: false });
-    fundService.debit.mockResolvedValue({ txNo: 'FT-3', duplicated: false });
+    fundService.recordBalanceRefund.mockResolvedValue({ txGroupNo: TX_GROUP_NO });
 
     svc = new RefundService(
       OUTER as never,
@@ -581,112 +554,53 @@ describe('退款领域层 RefundService（T080-A）', () => {
   // 4. execute —— BALANCE 三条流水记账
   // ==========================================================================
 
-  /** 取三条流水的入参（按调用顺序：credit、credit、debit） */
-  const threePosts = (): FundPost[] => [
-    fundService.credit.mock.calls[0]?.[0] as FundPost,
-    fundService.credit.mock.calls[1]?.[0] as FundPost,
-    fundService.debit.mock.calls[0]?.[0] as FundPost,
-  ];
-
-  it('BALANCE 退款写三条流水：金额恒等于退款单金额、方向顺序为 余额IN → 结转IN → 结转OUT', async () => {
+  it('BALANCE 退款 → 委托 fundService.recordBalanceRefund 一次：入参含 userId/amount/orderNo/refundNo、操作人 SYSTEM/0n，且必须传 tx', async () => {
     await svc.execute(REFUND_NO);
 
-    expect(fundService.credit).toHaveBeenCalledTimes(2);
-    expect(fundService.debit).toHaveBeenCalledTimes(1);
-
-    const [balance, settleIn, settleOut] = threePosts();
-
-    // ① 用户余额到账
-    expect(balance.bizType).toBe('BALANCE_REFUND');
-    expect(balance.accountId).toBe(3002n);
-    expect(balance.amount).toBe(10000n);
-    // ② 反向结转对-先：负债增
-    expect(settleIn.bizType).toBe('LIABILITY_SETTLE_IN');
-    expect(settleIn.accountId).toBe(3001n);
-    expect(settleIn.amount).toBe(10000n);
-    // ③ 反向结转对-后：收入减
-    expect(settleOut.bizType).toBe('LIABILITY_SETTLE_OUT');
-    expect(settleOut.accountId).toBe(3001n);
-    expect(settleOut.amount).toBe(10000n);
-
-    // 调用顺序：两次 credit 严格早于 debit（先 IN 后 OUT，中间态恒为 +N）
-    const seq = [
-      ...fundService.credit.mock.invocationCallOrder,
-      ...fundService.debit.mock.invocationCallOrder,
+    expect(fundService.recordBalanceRefund).toHaveBeenCalledTimes(1);
+    const [input, txArg] = fundService.recordBalanceRefund.mock.calls[0] as [
+      Record<string, unknown>,
+      unknown,
     ];
-    expect(seq).toEqual([...seq].sort((a, b) => a - b));
+
+    // 入参：金额恒等于退款单金额、锚定订单号与退款单号、操作人 SYSTEM/0n
+    expect(input.amount).toBe(10000n);
+    expect(input.userId).toBe(7n);
+    expect(input.orderNo).toBe('SO20260910000000000001');
+    expect(input.refundNo).toBe(REFUND_NO);
+    expect(input.operatorType).toBe('SYSTEM');
+    expect(input.operatorId).toBe(0n);
+    // 漏传 tx = 记账跑独立连接，事务 C 回滚时退款流水已落库 = 钱凭空退了两次（资损）
+    expect(txArg).toBe(TX);
+
+    // ⚠️ 三条流水的 bizType / isLiability / 先 IN 后 OUT / 同一 txGroupNo / counterparty 互指 /
+    // 退款单号溯源等「结算原语正确性」由 fundService.spec.ts 的 recordBalanceRefund 用例穷尽覆盖；
+    // 退款域只验证「委托确实发生」+「委托入参正确」，避免两套逻辑各自写一遍导致口径漂移。
   });
 
-  it('⚠️ isLiability 取值：BALANCE_REFUND=false、LIABILITY_SETTLE_IN=**true**、LIABILITY_SETTLE_OUT=**false**（退款是反向结转，与支付口径取反）', async () => {
+  it('recordBalanceRefund 抛错（如平台现金账户缺失）向上传播 → 异常穿透 execute，绝不伪装成退款成功', async () => {
     await svc.execute(REFUND_NO);
+    expect(fundService.recordBalanceRefund).toHaveBeenCalledTimes(1);
 
-    const [balance, settleIn, settleOut] = threePosts();
+    // 模拟 FundService 内部「平台现金账户不存在」拒记：异常必须穿透事务 C，
+    // 不能吞掉伪装成「退款成功」（否则订单已 REFUNDED 但钱没退 = 资金黑洞）
+    jest.clearAllMocks();
+    (withTransaction as unknown as jest.Mock<AnyAsyncFn>).mockImplementation(
+      async (fn: AnyAsyncFn) => fn(TX),
+    );
+    TX.refund.updateMany.mockResolvedValue({ count: 1 });
+    TX.refund.findUnique.mockResolvedValue(makeRefund());
+    TX.order.findUnique.mockResolvedValue(makeOrder());
+    TX.order.updateMany.mockResolvedValue({ count: 1 });
+    TX.refundItem.findMany.mockResolvedValue([]);
+    TX.payment.updateMany.mockResolvedValue({ count: 1 });
+    fundService.recordBalanceRefund.mockRejectedValue(
+      Object.assign(new Error('平台现金账户不存在，拒绝记账'), { code: ErrorCode.FUND_RECORD_FAILED }),
+    );
 
-    // 用户余额流水恒 false，不参与平台负债口径
-    expect(balance.isLiability).toBe(false);
-    // ⚠️ schema 注释写的是支付口径（IN=false）；退款是**反向**结转，这里必须是 true（负债增）
-    expect(settleIn.isLiability).toBe(true);
-    // ⚠️ schema 注释写的是支付口径（OUT=true）；退款是**反向**结转，这里必须是 false（收入减）
-    expect(settleOut.isLiability).toBe(false);
-  });
-
-  it('三条流水共享同一 txGroupNo，且 counterparty 互指（平台现金 ↔ 用户余额）', async () => {
-    await svc.execute(REFUND_NO);
-
-    const [balance, settleIn, settleOut] = threePosts();
-
-    expect(IdGenerator.txGroupNo).toHaveBeenCalledTimes(1);
-    expect(balance.txGroupNo).toBe(TX_GROUP_NO);
-    expect(settleIn.txGroupNo).toBe(TX_GROUP_NO);
-    expect(settleOut.txGroupNo).toBe(TX_GROUP_NO);
-
-    // 余额侧：账户=用户余额，对手方=平台现金
-    expect(balance.accountId).toBe(3002n);
-    expect(balance.counterpartyAccountId).toBe(3001n);
-    expect(balance.counterpartyAccountNo).toBe('ACC_PLATFORM_CASH');
-    // 平台侧两条：账户=平台现金，对手方=用户余额
-    expect(settleIn.counterpartyAccountId).toBe(3002n);
-    expect(settleIn.counterpartyAccountNo).toBe('ACC_USER_BALANCE_7');
-    expect(settleOut.counterpartyAccountId).toBe(3002n);
-    expect(settleOut.counterpartyAccountNo).toBe('ACC_USER_BALANCE_7');
-
-    // 流水必须锚定订单号与退款单号，否则对账无法溯源
-    expect(balance.refundNo).toBe(REFUND_NO);
-    expect(balance.orderNo).toBe('SO20260910000000000001');
-  });
-
-  it('三条流水的 (bizType, idempotencyKey) 组合互不相同 —— 撞 uk_biz_idem 会被静默判为幂等命中，钱不入账且不报错', async () => {
-    await svc.execute(REFUND_NO);
-
-    const posts = threePosts();
-    const keys = posts.map((p) => `${p.bizType}::${p.idempotencyKey ?? ''}`);
-
-    expect(keys).toEqual([
-      `BALANCE_REFUND::${REFUND_NO}`,
-      `LIABILITY_SETTLE_IN::${REFUND_NO}`,
-      `LIABILITY_SETTLE_OUT::${REFUND_NO}`,
-    ]);
-    // 唯一键 uk_biz_idem 是复合键 (biz_type, idempotency_key)：
-    // 三条流水 bizType 各不相同，同用 refundNo 也不会互撞；组合必须唯一。
-    expect(new Set(keys).size).toBe(3);
-  });
-
-  it('用户余额账户经 getOrCreateAccount 定位（且必须传 tx），平台现金账户不存在则抛错拒绝记账', async () => {
-    await svc.execute(REFUND_NO);
-
-    expect(fundService.getOrCreateAccount).toHaveBeenCalledTimes(1);
-    const call = fundService.getOrCreateAccount.mock.calls[0] as unknown[];
-    expect(call[0]).toBe(7n);
-    expect(call[1]).toBe('USER_BALANCE');
-    expect(call[2]).toBe(TX); // 漏传 tx = 记账跑独立连接，回滚时钱凭空多出来
-
-    // 平台现金账户缺失 → 拒绝记账（绝不自动创建：那意味着用没对过账的账户退钱）
-    TX.fundAccount.findFirst.mockResolvedValue(null);
-    fundService.credit.mockClear();
     await expect(svc.execute(REFUND_NO)).rejects.toMatchObject({
       code: ErrorCode.FUND_RECORD_FAILED,
     });
-    expect(fundService.credit).not.toHaveBeenCalled();
   });
 
   // ==========================================================================
@@ -712,7 +626,6 @@ describe('退款领域层 RefundService（T080-A）', () => {
     expect(TX.orderStatusLog.create).toHaveBeenCalledTimes(1);
     expect(TX.payment.updateMany).toHaveBeenCalledTimes(1);
     expect(TX.orderItem.updateMany).toHaveBeenCalledTimes(2);
-    expect(TX.fundAccount.findFirst).toHaveBeenCalledTimes(1);
 
     // 库存回仓必须拿到 tx（漏传 → 回滚后货已回仓但钱没退 = 白送一件货）
     expect(stockService.refundReturn).toHaveBeenCalledTimes(2);
@@ -720,14 +633,10 @@ describe('退款领域层 RefundService（T080-A）', () => {
       expect(call[1]).toBe(TX);
     }
 
-    // 记账同样必须拿到 tx：credit 两次 + debit 一次，逐个钉死第二参
-    // （漏传 → 记账跑独立连接，事务 C 回滚时退款流水已经落库 = 钱凭空退了两次）
-    expect(fundService.credit.mock.calls).toHaveLength(2);
-    expect(fundService.debit.mock.calls).toHaveLength(1);
-    for (const call of fundService.credit.mock.calls) {
-      expect(call[1]).toBe(TX);
-    }
-    expect(fundService.debit.mock.calls[0]?.[1]).toBe(TX);
+    // 记账必须拿到 tx：recordBalanceRefund 第二参 == TX（漏传 → 记账跑独立连接，
+    // 事务 C 回滚时退款流水已经落库 = 钱凭空退了两次）
+    expect(fundService.recordBalanceRefund).toHaveBeenCalledTimes(1);
+    expect(fundService.recordBalanceRefund.mock.calls[0]?.[1]).toBe(TX);
     // 按 sku_id 升序串行（防多订单并发死锁，F5.3）
     const skuSeq = stockService.refundReturn.mock.calls.map(
       (c) => (c[0] as { skuId: bigint }).skuId,
@@ -757,17 +666,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
     TX.refundItem.findMany.mockResolvedValue([]);
     TX.payment.updateMany.mockResolvedValue({ count: 1 });
     TX.fundAccount.findFirst.mockResolvedValue({ id: 3001n, accountNo: 'ACC_PLATFORM_CASH' });
-    fundService.getOrCreateAccount.mockResolvedValue({
-      id: 3002n,
-      accountNo: 'ACC_USER_BALANCE_7',
-      accountType: 'USER_BALANCE',
-      status: 'ACTIVE',
-      balance: 0n,
-      frozenBalance: 0n,
-      version: 0,
-    });
-    fundService.credit.mockResolvedValue({ txNo: 'FT-1', duplicated: false });
-    fundService.debit.mockResolvedValue({ txNo: 'FT-3', duplicated: false });
+    fundService.recordBalanceRefund.mockResolvedValue({ txGroupNo: TX_GROUP_NO });
 
     await svc.execute(REFUND_NO);
     const partArg = TX.order.updateMany.mock.calls[0]?.[0] as { data: Record<string, unknown> };
@@ -785,23 +684,16 @@ describe('退款领域层 RefundService（T080-A）', () => {
     expect(arg.data.status).toBe('REFUNDED');
   });
 
-  it('⚠️ 记账事务红线：三条流水的 credit / debit 第二参逐个必须等于事务 C 的 tx', async () => {
+  it('⚠️ 退款记账事务红线：fundService.recordBalanceRefund 第二参必须等于事务 C 的 tx', async () => {
     await svc.execute(REFUND_NO);
 
-    // 顺序：① 余额 IN ② 反向结转 IN（都是 credit）③ 反向结转 OUT（debit）
-    expect(fundService.credit).toHaveBeenCalledTimes(2);
-    expect(fundService.debit).toHaveBeenCalledTimes(1);
+    expect(fundService.recordBalanceRefund).toHaveBeenCalledTimes(1);
+    expect(fundService.recordBalanceRefund.mock.calls[0]?.[1]).toBe(TX);
 
-    expect(fundService.credit.mock.calls[0]?.[1]).toBe(TX);
-    expect(fundService.credit.mock.calls[1]?.[1]).toBe(TX);
-    expect(fundService.debit.mock.calls[0]?.[1]).toBe(TX);
-
-    // 三笔的 bizType 与位置一一对应，防止「顺序变了但 tx 断言仍通过」
-    expect(threePosts().map((p) => p.bizType)).toEqual([
-      'BALANCE_REFUND',
-      'LIABILITY_SETTLE_IN',
-      'LIABILITY_SETTLE_OUT',
-    ]);
+    // 入参 userId/refundNo 与退款单一致，防止「顺序没变但入参错了」的静默错账
+    const [input] = fundService.recordBalanceRefund.mock.calls[0] as [Record<string, unknown>];
+    expect(input.userId).toBe(7n);
+    expect(input.refundNo).toBe(REFUND_NO);
   });
 
   it('⚠️ 退款单推进是条件更新：execute 的 updateMany.where 必须带 status=PROCESSING', async () => {
@@ -841,9 +733,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
     expect(TX.refundItem.findMany).not.toHaveBeenCalled();
     expect(TX.fundAccount.findFirst).not.toHaveBeenCalled();
     expect(stockService.refundReturn).not.toHaveBeenCalled();
-    expect(fundService.credit).not.toHaveBeenCalled();
-    expect(fundService.debit).not.toHaveBeenCalled();
-    expect(fundService.getOrCreateAccount).not.toHaveBeenCalled();
+    expect(fundService.recordBalanceRefund).not.toHaveBeenCalled();
   });
 
   it('CHANNEL 退款（一期无 PaymentAdapter）→ 抛 ExternalServiceError 41004，不记账且订单状态不变', async () => {
@@ -853,11 +743,9 @@ describe('退款领域层 RefundService（T080-A）', () => {
       code: ErrorCode.REFUND_EXEC_FAILED,
     });
 
-    // 绝不允许「钱没确认退成功就先把账记了」
+    // 绝不允许「钱没确认退成功就先把账记了」：记账委托一次都不能发生
     expect(TX.fundAccount.findFirst).not.toHaveBeenCalled();
-    expect(fundService.getOrCreateAccount).not.toHaveBeenCalled();
-    expect(fundService.credit).not.toHaveBeenCalled();
-    expect(fundService.debit).not.toHaveBeenCalled();
+    expect(fundService.recordBalanceRefund).not.toHaveBeenCalled();
     // 订单状态 / 支付单 / 库存一次都不许动（F9.2「订单状态不变」）
     expect(TX.order.updateMany).not.toHaveBeenCalled();
     expect(TX.orderStatusLog.create).not.toHaveBeenCalled();
@@ -866,42 +754,20 @@ describe('退款领域层 RefundService（T080-A）', () => {
     expect(stockService.refundReturn).not.toHaveBeenCalled();
   });
 
-  it('第一条流水（余额 IN）抛错 → 向上传播，后续两条流水绝不执行', async () => {
-    fundService.credit.mockRejectedValueOnce(new Error('BALANCE_REFUND 写入失败'));
+  it('recordBalanceRefund 抛错 → 向上传播（绝不能被吞成「退款成功」）', async () => {
+    fundService.recordBalanceRefund.mockRejectedValueOnce(new Error('结算失败'));
 
-    await expect(svc.execute(REFUND_NO)).rejects.toThrow('BALANCE_REFUND 写入失败');
-
-    expect(fundService.credit).toHaveBeenCalledTimes(1);
-    expect(fundService.debit).not.toHaveBeenCalled();
+    await expect(svc.execute(REFUND_NO)).rejects.toThrow('结算失败');
+    // 真实回滚由 MySQL 事务保证；单测只验证「异常确实穿透 execute，没被 try/catch 吞掉」
+    expect(fundService.recordBalanceRefund).toHaveBeenCalledTimes(1);
   });
 
-  it('第二条流水（反向结转 IN）抛错 → 向上传播，第三条（结转 OUT）绝不执行', async () => {
-    fundService.credit
-      .mockResolvedValueOnce({ txNo: 'FT-1', duplicated: false })
-      .mockRejectedValueOnce(new Error('LIABILITY_SETTLE_IN 写入失败'));
-
-    await expect(svc.execute(REFUND_NO)).rejects.toThrow('LIABILITY_SETTLE_IN 写入失败');
-
-    expect(fundService.credit).toHaveBeenCalledTimes(2);
-    expect(fundService.debit).not.toHaveBeenCalled();
-  });
-
-  it('第三条流水（反向结转 OUT）抛错 → 向上传播（绝不能被吞掉变成「退款成功」）', async () => {
-    fundService.debit.mockRejectedValueOnce(new Error('LIABILITY_SETTLE_OUT 写入失败'));
-
-    await expect(svc.execute(REFUND_NO)).rejects.toThrow('LIABILITY_SETTLE_OUT 写入失败');
-
-    expect(fundService.credit).toHaveBeenCalledTimes(2);
-    expect(fundService.debit).toHaveBeenCalledTimes(1);
-  });
-
-  it('库存回仓抛错 → 向上传播，记账绝不执行（先回仓后记账的顺序不能被吞异常破坏）', async () => {
+  it('库存回仓抛错 → 向上传播，记账委托绝不执行（先回仓后记账的顺序不能被吞异常破坏）', async () => {
     stockService.refundReturn.mockRejectedValue(new Error('库存回仓失败'));
 
     await expect(svc.execute(REFUND_NO)).rejects.toThrow('库存回仓失败');
 
     expect(TX.payment.updateMany).not.toHaveBeenCalled();
-    expect(fundService.credit).not.toHaveBeenCalled();
-    expect(fundService.debit).not.toHaveBeenCalled();
+    expect(fundService.recordBalanceRefund).not.toHaveBeenCalled();
   });
 });

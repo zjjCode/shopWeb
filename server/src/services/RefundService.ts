@@ -48,7 +48,6 @@ import {
   RefundTarget,
   RefundType,
 } from '@prisma/client';
-import { FundAccountType, FundBizType } from '@/constants/enums';
 import {
   BusinessError,
   ConflictError,
@@ -482,7 +481,20 @@ export class RefundService {
         });
 
         // ---------- 步骤 6：记账（BALANCE 三条流水）----------
-        await this.recordBalanceRefund(refund, order, tx);
+        // 委托 FundService.recordBalanceRefund：负债结转对的「方向 / isLiability / 先 IN 后 OUT」
+        // 只在 FundService 一处实现并被单测覆盖，避免 RefundService 与 PaymentService 各写一套导致漂移。
+        // 必须传 tx：漏传会让记账跑独立连接 → 事务 C 回滚时账已记 → 钱凭空多出来（资损）。
+        await this.fundService.recordBalanceRefund(
+          {
+            userId: refund.userId,
+            amount: refund.amount,
+            orderNo: order.orderNo,
+            refundNo: refund.refundNo,
+            operatorType: OperatorType.SYSTEM,
+            operatorId: SYSTEM_OPERATOR_ID,
+          },
+          tx,
+        );
 
         // ---------- 步骤 7：幂等记录收尾 ----------
         // TODO(T080-B)：IdempotencyService 接入后在此把 scope=REFUND_EXEC / key=REFUND_EXEC:{refundNo}
@@ -875,117 +887,6 @@ export class RefundService {
     }
   }
 
-  /**
-   * 余额退款记账：同一 `txGroupNo` 下三条流水（F9.3）。
-   *
-   * @description 三条流水与方向（**本批最容易写错且写错无报错的地方**）：
-   *
-   * | # | 账户            | bizType                | 方向 | isLiability | 含义                     |
-   * |---|-----------------|------------------------|------|-------------|--------------------------|
-   * | ① | USER_BALANCE    | `BALANCE_REFUND`       | IN   | **false**   | 用户余额到账（负债已由 ② 记）|
-   * | ② | PLATFORM_CASH   | `LIABILITY_SETTLE_IN`  | IN   | **true**    | 反向结转：负债**增**      |
-   * | ③ | PLATFORM_CASH   | `LIABILITY_SETTLE_OUT` | OUT  | **false**   | 反向结转：收入**减**      |
-   *
-   * ⚠️ **反向结转，与支付口径取反**：`schema.prisma` 中这两个枚举的注释是**支付**口径
-   * （`LIABILITY_SETTLE_IN` is_liability=false「负债转收入」、`LIABILITY_SETTLE_OUT`
-   * is_liability=true「冲减负债」）。退款是**反向**结转，取值必须取反：
-   * `LIABILITY_SETTLE_IN` → **true** 先写、`LIABILITY_SETTLE_OUT` → **false** 后写
-   * （负债增 / 收入减），原文见 `docs/04-flows.md` F9.3 第 1171 行。
-   * 照抄 schema 注释会把负债方向记反 —— 表现为「负债总额算错但没有任何报错」。
-   *
-   * 顺序不可颠倒：②③ 这对结转必须**先 IN 后 OUT**（F6.6 写入铁律 2），
-   * 中间态恒为 `+N`，不会触发平台现金账户的 `CHECK(balance >= 0)`。
-   *
-   * 平台现金账户**必须查出来用，不存在就抛错，绝不自动创建**（与 PaymentService 同口径）：
-   * 它由种子数据预置，自动创建意味着有人在用一个没对过账的账户退钱。
-   * 用户余额账户走 `getOrCreateAccount`：退款用户此前可能没开过户（如渠道支付订单退余额）。
-   *
-   * 幂等键统一用 `refundNo`：唯一键 `uk_biz_idem` 是 `(biz_type, idempotency_key)`
-   * **复合键**，三条流水 `bizType` 各不相同，同键也不会互撞，重放时各撞各的。
-   *
-   * @param refund 退款单
-   * @param order 订单（提供 orderNo）
-   * @param tx 事务 C 的客户端（**必须传**：漏传会让记账跑独立连接 → 回滚时钱凭空多出来）
-   * @returns void
-   * @throws {BusinessError} 平台现金账户不存在（60001）→ 整笔回滚
-   */
-  private async recordBalanceRefund(
-    refund: ExecutingRefund,
-    order: ExecutingOrder,
-    tx: TxClient,
-  ): Promise<void> {
-    const platformAccount = await tx.fundAccount.findFirst({
-      where: { accountType: FundAccountType.PLATFORM_CASH },
-      select: { id: true, accountNo: true },
-    });
-    if (platformAccount === null) {
-      throw new BusinessError('平台现金账户不存在，拒绝记账', {
-        code: ErrorCode.FUND_RECORD_FAILED,
-      });
-    }
-
-    const userAccount = await this.fundService.getOrCreateAccount(
-      refund.userId,
-      FundAccountType.USER_BALANCE,
-      tx,
-    );
-
-    const txGroupNo = IdGenerator.txGroupNo();
-    const common = {
-      amount: refund.amount,
-      txGroupNo,
-      orderNo: order.orderNo,
-      refundNo: refund.refundNo,
-      // uk_biz_idem 是 (biz_type, idempotency_key) 复合键，三条流水 bizType 不同，同键不互撞
-      idempotencyKey: refund.refundNo,
-      operatorType: OperatorType.SYSTEM,
-      operatorId: SYSTEM_OPERATOR_ID,
-    };
-
-    // ① 用户余额到账：USER_BALANCE 流水恒 false，不参与平台负债口径
-    await this.fundService.credit(
-      {
-        ...common,
-        accountId: userAccount.id,
-        bizType: FundBizType.BALANCE_REFUND,
-        isLiability: false,
-        counterpartyAccountId: platformAccount.id,
-        counterpartyAccountNo: platformAccount.accountNo,
-        remark: `退款退回余额 ${refund.refundNo}`,
-      },
-      tx,
-    );
-
-    // ② 反向结转对-先：负债**增**（退款 = 平台重新欠用户这笔钱）
-    //    ⚠️ 反向结转，与支付口径取反：这里是 true（schema 注释的 false 是支付口径）
-    await this.fundService.credit(
-      {
-        ...common,
-        accountId: platformAccount.id,
-        bizType: FundBizType.LIABILITY_SETTLE_IN,
-        isLiability: true,
-        counterpartyAccountId: userAccount.id,
-        counterpartyAccountNo: userAccount.accountNo,
-        remark: `退款反向结转-负债增加 ${refund.refundNo}`,
-      },
-      tx,
-    );
-
-    // ③ 反向结转对-后：收入**减**（订单收入回退）
-    //    ⚠️ 反向结转，与支付口径取反：这里是 false（schema 注释的 true 是支付口径）
-    await this.fundService.debit(
-      {
-        ...common,
-        accountId: platformAccount.id,
-        bizType: FundBizType.LIABILITY_SETTLE_OUT,
-        isLiability: false,
-        counterpartyAccountId: userAccount.id,
-        counterpartyAccountNo: userAccount.accountNo,
-        remark: `退款反向结转-收入冲减 ${refund.refundNo}`,
-      },
-      tx,
-    );
-  }
 }
 
 /** 默认单例（供 Controller / Worker 直接消费，T080-B 接入） */

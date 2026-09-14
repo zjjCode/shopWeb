@@ -78,6 +78,7 @@ type AnyAsyncFn = (...args: any[]) => Promise<any>;
 interface Delegates {
   fundAccount: {
     findUnique: jest.Mock<AnyAsyncFn>;
+    findFirst: jest.Mock<AnyAsyncFn>;
     create: jest.Mock<AnyAsyncFn>;
     updateMany: jest.Mock<AnyAsyncFn>;
   };
@@ -93,6 +94,7 @@ function makeDelegates(): Delegates {
   return {
     fundAccount: {
       findUnique: jest.fn<AnyAsyncFn>(),
+      findFirst: jest.fn<AnyAsyncFn>(),
       create: jest.fn<AnyAsyncFn>(),
       updateMany: jest.fn<AnyAsyncFn>(),
     },
@@ -177,6 +179,7 @@ describe('FundService 资金记账', () => {
       client.fundAccount.updateMany.mockResolvedValue({ count: 1 });
       client.fundTransaction.create.mockResolvedValue({ txNo: 'FT2026090700000001' });
       client.fundAccount.findUnique.mockResolvedValue(null);
+      client.fundAccount.findFirst.mockResolvedValue(PLATFORM);
     }
 
     svc = new FundService(defaultClient as never);
@@ -587,5 +590,187 @@ describe('FundService 资金记账', () => {
       svc.getOrCreateAccount(0n, FundAccountType.PLATFORM_CASH, FAKE_TX as never),
     ).rejects.toMatchObject({ code: ErrorCode.FUND_RECORD_FAILED });
     expect(txClient.fundAccount.create).not.toHaveBeenCalled();
+  });
+
+  // --------------------------------------------------------------------------
+  // 余额支付 / 退款结算原语（F6.6 / F9.3 负债结转对）
+  // --------------------------------------------------------------------------
+
+  /** 用户余额账户快照（getOrCreateAccount 命中已有账户，不新建） */
+  const USER_SNAPSHOT = {
+    id: USER.id,
+    accountNo: USER.accountNo,
+    accountType: FundAccountType.USER_BALANCE,
+    status: AccountStatus.ACTIVE,
+    balance: 100_000n,
+    frozenBalance: 0n,
+    version: 0,
+  };
+
+  /** 按账户 id 返回对应的 FOR UPDATE 锁行（用户 / 平台两套余额） */
+  const settleLockRows = (): void => {
+    txClient.$queryRaw.mockImplementation(async (...args: unknown[]) => {
+      const accountId = args[1] as bigint;
+      return accountId === PLATFORM.id
+        ? makeLockRow({ id: PLATFORM.id, accountNo: PLATFORM.accountNo, balance: 50_000n })
+        : makeLockRow({ id: USER.id, balance: 100_000n });
+    });
+  };
+
+  it('recordBalancePayment：写三条流水，方向/isLiability/账户/对手方/orderNo/paymentNo 正确，且全走 tx', async () => {
+    txClient.fundAccount.findUnique.mockResolvedValue(USER_SNAPSHOT);
+    txClient.fundAccount.findFirst.mockResolvedValue({ id: PLATFORM.id, accountNo: PLATFORM.accountNo });
+    settleLockRows();
+
+    const result = await svc.recordBalancePayment(
+      {
+        userId: 7n,
+        amount: 2_000n,
+        orderNo: 'SO2026091000000001',
+        paymentNo: 'P2026091000000001',
+        operatorType: OperatorType.SYSTEM,
+        operatorId: 0n,
+      },
+      FAKE_TX as never,
+    );
+
+    // 三条流水共享同一 txGroupNo
+    expect(result.txGroupNo).toEqual(expect.any(String));
+    const [userTx, platInTx, platOutTx] = txClient.fundTransaction.create.mock.calls.map(
+      (c) => (c[0] as { data: Record<string, unknown> }).data,
+    );
+    expect(userTx.txGroupNo).toBe(result.txGroupNo);
+    expect(platInTx.txGroupNo).toBe(result.txGroupNo);
+    expect(platOutTx.txGroupNo).toBe(result.txGroupNo);
+
+    // ① 用户余额 OUT（BALANCE_CONSUME，恒 false）
+    expect(userTx.direction).toBe(FundDirection.OUT);
+    expect(userTx.bizType).toBe(FundBizType.BALANCE_CONSUME);
+    expect(userTx.isLiability).toBe(false);
+    expect(userTx.accountId).toBe(USER.id);
+    expect(userTx.counterpartyAccountId).toBe(PLATFORM.id);
+    expect(userTx.orderNo).toBe('SO2026091000000001');
+    expect(userTx.paymentNo).toBe('P2026091000000001');
+
+    // ② 平台结转 IN（LIABILITY_SETTLE_IN，支付口径 isLiability=false：负债转收入）
+    expect(platInTx.direction).toBe(FundDirection.IN);
+    expect(platInTx.bizType).toBe(FundBizType.LIABILITY_SETTLE_IN);
+    expect(platInTx.isLiability).toBe(false);
+    expect(platInTx.accountId).toBe(PLATFORM.id);
+    expect(platInTx.counterpartyAccountId).toBe(USER.id);
+
+    // ③ 平台结转 OUT（LIABILITY_SETTLE_OUT，支付口径 isLiability=true：冲减负债）
+    expect(platOutTx.direction).toBe(FundDirection.OUT);
+    expect(platOutTx.bizType).toBe(FundBizType.LIABILITY_SETTLE_OUT);
+    expect(platOutTx.isLiability).toBe(true);
+    expect(platOutTx.accountId).toBe(PLATFORM.id);
+    expect(platOutTx.counterpartyAccountId).toBe(USER.id);
+    expect(platOutTx.paymentNo).toBe('P2026091000000001');
+
+    // 事务红线：全写 tx，默认 client 零调用
+    expect(defaultClient.fundTransaction.create).not.toHaveBeenCalled();
+    expect(defaultClient.fundAccount.updateMany).not.toHaveBeenCalled();
+    expect(defaultClient.fundAccount.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('recordBalanceRefund：反向结转对（与支付口径取反）—— BALANCE_REFUND=false、LIABILITY_SETTLE_IN=**true**、LIABILITY_SETTLE_OUT=**false**，方向 IN/IN/OUT', async () => {
+    txClient.fundAccount.findUnique.mockResolvedValue(USER_SNAPSHOT);
+    txClient.fundAccount.findFirst.mockResolvedValue({ id: PLATFORM.id, accountNo: PLATFORM.accountNo });
+    settleLockRows();
+
+    const result = await svc.recordBalanceRefund(
+      {
+        userId: 7n,
+        amount: 2_000n,
+        orderNo: 'SO2026091000000001',
+        refundNo: 'SR2026091000000001',
+        operatorType: OperatorType.SYSTEM,
+        operatorId: 0n,
+      },
+      FAKE_TX as never,
+    );
+
+    const [userTx, platInTx, platOutTx] = txClient.fundTransaction.create.mock.calls.map(
+      (c) => (c[0] as { data: Record<string, unknown> }).data,
+    );
+
+    // ① 用户余额 IN（BALANCE_REFUND，恒 false）
+    expect(userTx.direction).toBe(FundDirection.IN);
+    expect(userTx.bizType).toBe(FundBizType.BALANCE_REFUND);
+    expect(userTx.isLiability).toBe(false);
+    expect(userTx.accountId).toBe(USER.id);
+    expect(userTx.counterpartyAccountId).toBe(PLATFORM.id);
+    expect(userTx.refundNo).toBe('SR2026091000000001');
+
+    // ② 平台结转 IN（⚠️ 反向结转：isLiability=true 负债增）
+    expect(platInTx.direction).toBe(FundDirection.IN);
+    expect(platInTx.bizType).toBe(FundBizType.LIABILITY_SETTLE_IN);
+    expect(platInTx.isLiability).toBe(true);
+    expect(platInTx.accountId).toBe(PLATFORM.id);
+    expect(platInTx.counterpartyAccountId).toBe(USER.id);
+
+    // ③ 平台结转 OUT（⚠️ 反向结转：isLiability=false 收入减）
+    expect(platOutTx.direction).toBe(FundDirection.OUT);
+    expect(platOutTx.bizType).toBe(FundBizType.LIABILITY_SETTLE_OUT);
+    expect(platOutTx.isLiability).toBe(false);
+    expect(platOutTx.accountId).toBe(PLATFORM.id);
+    expect(platOutTx.counterpartyAccountId).toBe(USER.id);
+
+    expect(result.txGroupNo).toEqual(expect.any(String));
+
+    // 事务红线：全写 tx
+    expect(defaultClient.fundTransaction.create).not.toHaveBeenCalled();
+    expect(defaultClient.fundAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('recordBalancePayment：用户余额不足 → 抛 61002，且不写任何流水（事务回滚）', async () => {
+    txClient.fundAccount.findUnique.mockResolvedValue(USER_SNAPSHOT);
+    txClient.fundAccount.findFirst.mockResolvedValue({ id: PLATFORM.id, accountNo: PLATFORM.accountNo });
+    // 用户余额锁行只有 500 分，支付 1000 分必失败
+    txClient.$queryRaw.mockImplementation(async (...args: unknown[]) => {
+      const accountId = args[1] as bigint;
+      return accountId === PLATFORM.id
+        ? makeLockRow({ id: PLATFORM.id, accountNo: PLATFORM.accountNo, balance: 50_000n })
+        : makeLockRow({ id: USER.id, balance: 500n });
+    });
+
+    await expect(
+      svc.recordBalancePayment(
+        {
+          userId: 7n,
+          amount: 1_000n,
+          orderNo: 'SO2026091000000001',
+          paymentNo: 'P2026091000000001',
+          operatorType: OperatorType.SYSTEM,
+          operatorId: 0n,
+        },
+        FAKE_TX as never,
+      ),
+    ).rejects.toMatchObject({ code: ErrorCode.BALANCE_NOT_ENOUGH });
+
+    // 余额不足在 doPost 内于「写流水」之前即抛错：不落任何流水、不动任何余额
+    expect(txClient.fundTransaction.create).not.toHaveBeenCalled();
+    expect(txClient.fundAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('recordBalancePayment：平台现金账户不存在 → 抛 60001，绝不自动创建', async () => {
+    txClient.fundAccount.findUnique.mockResolvedValue(USER_SNAPSHOT);
+    txClient.fundAccount.findFirst.mockResolvedValue(null); // 平台账户缺失
+
+    await expect(
+      svc.recordBalancePayment(
+        {
+          userId: 7n,
+          amount: 1_000n,
+          orderNo: 'SO2026091000000001',
+          paymentNo: 'P2026091000000001',
+          operatorType: OperatorType.SYSTEM,
+          operatorId: 0n,
+        },
+        FAKE_TX as never,
+      ),
+    ).rejects.toMatchObject({ code: ErrorCode.FUND_RECORD_FAILED });
+
+    expect(txClient.fundTransaction.create).not.toHaveBeenCalled();
   });
 });

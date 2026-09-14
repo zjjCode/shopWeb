@@ -92,6 +92,7 @@ export const ErrorCode = {
   PAYMENT_AMOUNT_MISMATCH: 40002,
   PAYMENT_CLOSED: 40003,
   PAYMENT_FINAL_STATE: 40004,
+  PAYMENT_CHANNEL_MISMATCH: 40005,
 
   // ---------------- 41xxx 退款 ----------------
   REFUND_NOT_FOUND: 41001,
@@ -233,6 +234,7 @@ export const ERROR_META: Record<ErrorCodeValue, ErrorMeta> = {
   [ErrorCode.PAYMENT_AMOUNT_MISMATCH]: { httpStatus: 409, message: '支付金额与订单金额不一致' },
   [ErrorCode.PAYMENT_CLOSED]: { httpStatus: 409, message: '支付单已关闭' },
   [ErrorCode.PAYMENT_FINAL_STATE]: { httpStatus: 409, message: '支付单状态已终态' },
+  [ErrorCode.PAYMENT_CHANNEL_MISMATCH]: { httpStatus: 409, message: '该支付单支付方式与请求不匹配' },
 
   [ErrorCode.REFUND_NOT_FOUND]: { httpStatus: 404, message: '退款单不存在' },
   [ErrorCode.REFUND_AMOUNT_EXCEEDED]: { httpStatus: 409, message: '退款金额超过可退金额' },
