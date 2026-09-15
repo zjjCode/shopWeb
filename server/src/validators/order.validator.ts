@@ -64,8 +64,8 @@ export const createOrderSchema = z
       .max(MAX_BUYER_REMARK, `买家备注不可超过 ${MAX_BUYER_REMARK} 字`)
       .nullish(),
     /**
-     * 优惠券 ID（可空）。**本期恒为 null**：券占用需与建单同事务，
-     * 待 T041 的 CouponService 就绪后启用。
+     * 优惠券 ID（可空）。T041 已启用：传入时在 `OrderService` 事务外解析券优惠
+     * （状态/过期/门槛/适用范围），事务 A 内占用（UNUSED→LOCKED）并与建单同事务。
      */
     couponId: bigintId.nullish(),
   })

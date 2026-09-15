@@ -24,6 +24,7 @@ import { ConflictError } from '@/core/errors';
 import { ErrorCode } from '@/core/errors/errorCodes';
 import { withTransaction } from '@/core/transaction';
 import { OrderService, type CreateOrderInput } from '@/services/OrderService';
+import type { CouponService } from '@/services/CouponService';
 import type { PriceResult, PriceService } from '@/services/PriceService';
 import type { StockService } from '@/services/StockService';
 
@@ -429,6 +430,92 @@ describe('OrderService 下单（事务 A）', () => {
       code: ErrorCode.ORDER_AMOUNT_INVALID,
     });
     expect(prisma.order.create).not.toHaveBeenCalled();
+  });
+
+  it('带券下单：事务内 lockForOrder（先）→ 冻结库存 → 建单 → bindForOrder（后），订单金额扣减券优惠', async () => {
+    prisma.cartItem.findMany.mockResolvedValue([makeCartItem(11n, 2001n, 1)]);
+    const price = makePrice([{ skuId: 2001n, quantity: 1, unitPrice: 10000n }]); // 应付 10000
+    priceService.calculate.mockResolvedValue(price);
+
+    // 注入假优惠券服务：resolveForOrder 返回 5 号券、优惠 2000 分；lock/bind 为桩
+    const couponService = {
+      resolveForOrder: jest.fn<AnyAsyncFn>().mockResolvedValue({ couponId: 5n, templateId: 55n, discountAmount: 2000n }),
+      lockForOrder: jest.fn<AnyAsyncFn>(),
+      bindForOrder: jest.fn<AnyAsyncFn>(),
+    };
+    const svcWithCoupon = new OrderService(
+      prisma as never,
+      stockService as unknown as StockService,
+      priceService as unknown as PriceService,
+      couponService as unknown as CouponService,
+    );
+
+    const result = await svcWithCoupon.createOrder(1n, { ...baseInput, couponId: 5n });
+
+    // 应付 = 重算应付 - 券优惠 = 10000 - 2000 = 8000
+    expect(result.payAmount).toBe(8000n);
+    expect(couponService.resolveForOrder).toHaveBeenCalledTimes(1);
+    const orderCreateArg = prisma.order.create.mock.calls[0]?.[0] as {
+      data: { couponDiscount: bigint; payAmount: bigint };
+    };
+    expect(orderCreateArg.data.couponDiscount).toBe(2000n);
+    expect(orderCreateArg.data.payAmount).toBe(8000n);
+
+    // 占用分两步：lockForOrder（建单前）、bindForOrder（建单后）
+    expect(couponService.lockForOrder).toHaveBeenCalledTimes(1);
+    expect(couponService.bindForOrder).toHaveBeenCalledTimes(1);
+
+    // 先券后库存：lockForOrder 在冻结库存之前；bindForOrder 在冻结库存之后（建单拿到 orderId 才绑）
+    const lockOrder = couponService.lockForOrder.mock.invocationCallOrder[0]!;
+    const freezeOrder = stockService.freeze.mock.invocationCallOrder[0]!;
+    const bindOrder = couponService.bindForOrder.mock.invocationCallOrder[0]!;
+    expect(lockOrder).toBeLessThan(freezeOrder);
+    expect(bindOrder).toBeGreaterThan(freezeOrder);
+
+    // lockForOrder 收到事务闭包内的 tx，且只用 orderNo（无 orderId）
+    expect(couponService.lockForOrder.mock.calls[0]?.[3]).toBe(FAKE_TX);
+    const lockInput = couponService.lockForOrder.mock.calls[0]?.[2] as { orderNo: string; discountAmount: bigint };
+    expect(lockInput.orderNo).toBe(result.orderNo);
+    expect(lockInput.discountAmount).toBe(2000n);
+
+    // bindForOrder 收到同一 tx，且拿到建单后的 orderId
+    expect(couponService.bindForOrder.mock.calls[0]?.[3]).toBe(FAKE_TX);
+    const bindInput = couponService.bindForOrder.mock.calls[0]?.[2] as {
+      orderId: bigint;
+      orderNo: string;
+      discountAmount: bigint;
+    };
+    expect(bindInput.orderId).toBe(9001n); // order.create 桩返回 id=9001n
+    expect(bindInput.orderNo).toBe(result.orderNo);
+    expect(bindInput.discountAmount).toBe(2000n);
+  });
+
+  it('库存冻结失败（含券订单）：lockForOrder 已执行但整事务回滚，绝不建单', async () => {
+    prisma.cartItem.findMany.mockResolvedValue([makeCartItem(11n, 2001n, 1)]);
+    stockService.freeze.mockRejectedValue(
+      new ConflictError('库存不足', { code: ErrorCode.STOCK_NOT_ENOUGH }),
+    );
+
+    const couponService = {
+      resolveForOrder: jest.fn<AnyAsyncFn>().mockResolvedValue({ couponId: 5n, templateId: 55n, discountAmount: 2000n }),
+      lockForOrder: jest.fn<AnyAsyncFn>(),
+      bindForOrder: jest.fn<AnyAsyncFn>(),
+    };
+    const svcWithCoupon = new OrderService(
+      prisma as never,
+      stockService as unknown as StockService,
+      priceService as unknown as PriceService,
+      couponService as unknown as CouponService,
+    );
+
+    await expect(svcWithCoupon.createOrder(1n, { ...baseInput, couponId: 5n })).rejects.toMatchObject({
+      code: ErrorCode.STOCK_NOT_ENOUGH,
+    });
+
+    // 关键：锁券在冻结前执行了，但冻结失败 → 建单/绑券不执行，事务整体回滚（资金安全铁律）
+    expect(couponService.lockForOrder).toHaveBeenCalledTimes(1);
+    expect(prisma.order.create).not.toHaveBeenCalled();
+    expect(couponService.bindForOrder).not.toHaveBeenCalled();
   });
 
   it('行实付合计 + 运费 != 应付（E7 被破坏）→ 拒绝下单（31003）', async () => {

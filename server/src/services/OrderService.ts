@@ -20,9 +20,10 @@
  *
  * 死锁预防：多 SKU 冻结严格按 `sku_id` **升序**处理，保证不同订单对同一批 SKU 的加锁顺序一致（F5.3）。
  *
- * ⚠️ 本期边界（T050 / T051）：
- * - **不做券**：`couponId` 一律按 null 处理，不写 `order_coupon_records`。券占用必须与建单同事务，
- *   待 T041 的 CouponService 就绪后在此补（见阶段 3 的 TODO）。关单/取消时亦无券可解冻（见 T051）。
+ * ⚠️ 本期边界（T050 / T051 / T041）：
+ * - **券（T041 已接入）**：`couponId` 可选；传入时在事务外解析券优惠（状态/过期/门槛/适用范围），
+ *   事务 A 内分两步：`lockForOrder`（UNUSED→LOCKED，建单前、仅 orderNo）先于「冻结库存」（F5.5「先券后库存」），
+ *   建单拿到 orderId 后再 `bindForOrder` 写券记录（与建单同事务）。库存冻结失败则整事务回滚、绝不产生待支付订单。
  * - **注册延迟关单 job**：T051 已接入 BullMQ `order-close` 队列（delay = expireAt - now，jobId = orderNo），
  *   注册失败仅 warn、不阻塞下单，靠 cron 兜底扫描补偿（F7.2 / F10）。
  */
@@ -47,6 +48,7 @@ import { orderNo as generateOrderNo } from '@/core/idGenerator';
 import { getPrisma } from '@/core/prisma';
 import { withTransaction } from '@/core/transaction';
 import { transition } from '@/services/OrderStateMachine';
+import { CouponService, type ResolvedCoupon } from '@/services/CouponService';
 import {
   FREIGHT_FREE_THRESHOLD_CENTS,
   PriceService,
@@ -137,20 +139,25 @@ export class OrderService {
   private readonly stockService: StockService;
   /** 计价服务（服务端重算用） */
   private readonly priceService: PriceService;
+  /** 优惠券服务（下单占用 / 优惠计算，T041） */
+  private readonly couponService: CouponService;
 
   /**
    * @param prisma Prisma 客户端，缺省取全局单例
    * @param stockService 库存服务，缺省新建
    * @param priceService 计价服务，缺省新建
+   * @param couponService 优惠券服务，缺省新建
    */
   constructor(
     prisma: DbClient = getPrisma(),
     stockService: StockService = new StockService(),
     priceService: PriceService = new PriceService(),
+    couponService: CouponService = new CouponService(),
   ) {
     this.prisma = prisma;
     this.stockService = stockService;
     this.priceService = priceService;
+    this.couponService = couponService;
   }
 
   /**
@@ -174,8 +181,33 @@ export class OrderService {
       items: cartItems.map((it) => ({ skuId: it.skuId, quantity: it.quantity })),
     });
 
+    // 券优惠（事务外只读解析：状态/过期/门槛/适用范围；返回券优惠额，异常在事务外抛出无副作用）
+    let resolvedCoupon: ResolvedCoupon | null = null;
+    if (input.couponId != null && input.couponId > 0n) {
+      const payableBySku = new Map(price.items.map((pi) => [pi.skuId.toString(), pi.payableAmount]));
+      const couponItems = cartItems.map((it) => ({
+        skuId: it.skuId,
+        productId: it.sku?.product?.id ?? 0n,
+        payableAmount: payableBySku.get(it.skuId.toString()) ?? 0n,
+      }));
+      resolvedCoupon = await this.couponService.resolveForOrder(userId, input.couponId, couponItems);
+    }
+    // 含券最终价：应付 = 重算应付 - 券优惠（恒等式 E1 已含 couponDiscount）
+    const orderPrice: PriceResult = {
+      ...price,
+      items: price.items.map((it) => ({ ...it })),
+      couponDiscount: resolvedCoupon?.discountAmount ?? 0n,
+      payAmount: price.payAmount - (resolvedCoupon?.discountAmount ?? 0n),
+    };
+
+    // 券优惠按行实付比例分摊到订单行（保证 E7：Σ行实付 + 运费 == 应付，且行级金额可独立对账/退款）。
+    // 必须在 resolveForOrder 之后（门槛基于促销后金额，与券分摊无关）、assertAmountIdentity 之前。
+    if (resolvedCoupon !== null && orderPrice.couponDiscount > 0n) {
+      this.allocateCoupon(orderPrice.items, orderPrice.couponDiscount);
+    }
+
     // 重算后立刻断言恒等式，避免把错误金额带进事务（F5 阶段 2 的 alt 分支）
-    this.assertAmountIdentity(price);
+    this.assertAmountIdentity(orderPrice);
 
     // ---------- 阶段 3：事务 A ----------
     const orderNo = generateOrderNo();
@@ -186,11 +218,20 @@ export class OrderService {
 
     await withTransaction(
       async (tx) => {
-        // TODO(T041)：券占用 UNUSED → LOCKED 需与建单同事务（UPDATE coupons ... WHERE status='UNUSED'，
-        // affectedRows=0 即已被占用 → 12007），并写 order_coupon_records + coupon_use_logs。
-        // 本期 couponId 恒为 null，不做占用。
+        // 1) 锁券行（先券后库存，F5.5：必须在冻结库存之前、建单之前；无券则跳过）
+        //    仅 UNUSED→LOCKED + 轨迹，此时尚无 orderId，故不写 order_coupon_records。
+        //    锁券失败（并发占用 / 非本人）直接抛错，后续冻结与建单都不会执行，事务整体回滚。
+        if (resolvedCoupon !== null) {
+          await this.couponService.lockForOrder(
+            resolvedCoupon.couponId,
+            userId,
+            { orderNo, discountAmount: resolvedCoupon.discountAmount },
+            tx,
+          );
+        }
 
-        // 1) 冻结库存（在事务内，tx 必须传下去）
+        // 2) 冻结库存（在事务内，tx 必须传下去；按 sku_id 升序，防并发死锁 F5.3）。
+        //    必须先于建单：库存不足时冻结抛错，建单/锁券随事务回滚，绝不留「没库存却待支付」的订单（资金铁律）。
         for (const item of orderedItems) {
           // eslint-disable-next-line no-await-in-loop -- 顺序敏感：必须按 sku_id 升序串行，并行会破坏加锁顺序
           await this.stockService.freeze(
@@ -206,19 +247,19 @@ export class OrderService {
           );
         }
 
-        // 2) 建单（地址在此刻固化为快照，之后删改地址不影响历史订单）
+        // 3) 建单（地址在此刻固化为快照，之后删改地址不影响历史订单；金额含券优惠）
         const order = await tx.order.create({
           data: {
             orderNo,
             userId,
             status: OrderStatus.PENDING_PAYMENT,
-            goodsAmount: price.goodsAmount,
-            freightAmount: price.freightAmount,
-            rowPromoDiscount: price.rowPromoDiscount,
-            orderPromoDiscount: price.orderPromoDiscount,
-            couponDiscount: price.couponDiscount,
-            pointDeductAmount: price.pointDeductAmount,
-            payAmount: price.payAmount,
+            goodsAmount: orderPrice.goodsAmount,
+            freightAmount: orderPrice.freightAmount,
+            rowPromoDiscount: orderPrice.rowPromoDiscount,
+            orderPromoDiscount: orderPrice.orderPromoDiscount,
+            couponDiscount: orderPrice.couponDiscount,
+            pointDeductAmount: orderPrice.pointDeductAmount,
+            payAmount: orderPrice.payAmount,
             freeThreshold: FREIGHT_FREE_THRESHOLD_CENTS,
             receiverName: address.receiverName,
             receiverPhone: address.phone,
@@ -232,8 +273,18 @@ export class OrderService {
           },
         });
 
-        // 3) 订单行：按 PriceService 返回的行明细写快照与分摊结果
-        const priceBySku = new Map(price.items.map((pi) => [pi.skuId.toString(), pi]));
+        // 4) 绑定券记录（建单后才有 orderId，与建单同事务；无券则跳过）
+        if (resolvedCoupon !== null) {
+          await this.couponService.bindForOrder(
+            resolvedCoupon.couponId,
+            userId,
+            { orderId: order.id, orderNo, discountAmount: resolvedCoupon.discountAmount },
+            tx,
+          );
+        }
+
+        // 5) 订单行：按 PriceService 返回的行明细写快照与分摊结果
+        const priceBySku = new Map(orderPrice.items.map((pi) => [pi.skuId.toString(), pi]));
         for (const item of cartItems) {
           const row = priceBySku.get(item.skuId.toString());
           if (row === undefined || item.sku === null || item.sku.product === null) {
@@ -264,7 +315,7 @@ export class OrderService {
           });
         }
 
-        // 4) 订单轨迹（只增不改不删，fromStatus 为 NULL 表示创建）
+        // 6) 订单轨迹（只增不改不删，fromStatus 为 NULL 表示创建）
         await tx.orderStatusLog.create({
           data: {
             orderId: order.id,
@@ -276,7 +327,7 @@ export class OrderService {
           },
         });
 
-        // 5) 清理已结算的购物车条目（带 userId 防越权）
+        // 7) 清理已结算的购物车条目（带 userId 防越权）
         await tx.cartItem.deleteMany({
           where: { id: { in: cartItems.map((it) => it.id) }, userId },
         });
@@ -292,7 +343,7 @@ export class OrderService {
       void enqueue(QUEUE_NAMES.ORDER_CLOSE, 'closeTimeoutOrder', { orderNo }, { jobId: orderNo, delayMs });
     }
 
-    return { orderNo, payAmount: price.payAmount, expireAt };
+    return { orderNo, payAmount: orderPrice.payAmount, expireAt };
   }
 
   // ==========================================================================
@@ -302,8 +353,9 @@ export class OrderService {
   /**
    * 超时关单（系统触发）：PENDING_PAYMENT → CANCELLED（F10）。
    *
-   * 同事务副作用：**释放冻结库存**（`frozen → available`，ORDER_RELEASE）+ **关闭待支付支付单**
-   * （若有；下单即支付场景下此时通常尚无支付单）。**无资金流水、无券**（本期券未占用，见 T050）。
+   * 同事务副作用：**释放冻结库存**（`frozen → available`，ORDER_RELEASE）+ **解冻券**
+   * （`LOCKED → UNUSED`，`CouponService.releaseByOrderNo`，T041）+ **关闭待支付支付单**
+   * （若有；下单即支付场景下此时通常尚无支付单）。**无资金流水**。
    *
    * 幂等保障（F7.2 / F10）：
    * - 进入事务前先 `WHERE status='PENDING_PAYMENT'` 预筛，已支付/已取消/已关单的直接跳过；
@@ -339,6 +391,8 @@ export class OrderService {
         }
         await this.releaseFrozenStock(tx, order.id, orderNo, OperatorType.SYSTEM, 0n, CancelReason.TIMEOUT);
         await this.closePendingPayments(tx, order.id);
+        // 解冻被占用的券（T041：下单占用 UNUSED→LOCKED，关单需退回 UNUSED；无券记录/已解冻均幂等跳过）
+        await this.couponService.releaseByOrderNo(orderNo, tx);
         return n;
       },
       { label: 'order.closeTimeout' },
@@ -647,6 +701,8 @@ export class OrderService {
           params.cancelReason,
         );
         await this.closePendingPayments(tx, order.id);
+        // 解冻被占用的券（T041：与关单同逻辑，LOCKED→UNUSED，幂等跳过）
+        await this.couponService.releaseByOrderNo(params.orderNo, tx);
       },
       { label: 'order.cancel' },
     );
@@ -797,6 +853,32 @@ export class OrderService {
           httpStatus: 409,
         });
       }
+    }
+  }
+
+  /**
+   * 将券优惠按比例分摊到各订单行（修改行实付与行已分摊）。
+   *
+   * @description 券是订单级优惠，但必须落到行上才能保持 E7（`Σ行实付 + 运费 == 应付`）成立，
+   * 也便于后续按行对账 / 退款。`computeDiscount` 已保证券优惠 ≤ 促销后商品金额，故分摊无溢出；
+   * 按比例取整的零头归末行吸收。
+   * @param items 订单行（会被原地修改 payableAmount / allocatedDiscount）
+   * @param couponDiscount 券优惠额（分）
+   */
+  private allocateCoupon(items: PriceResult['items'], couponDiscount: bigint): void {
+    const totalPayable = items.reduce<bigint>((acc, it) => acc + it.payableAmount, 0n);
+    if (totalPayable <= 0n) {
+      return;
+    }
+    let remaining = couponDiscount;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i]!;
+      // 末行吸收取整零头，保证 Σ分摊 == 券优惠
+      const share = i === items.length - 1 ? remaining : (couponDiscount * it.payableAmount) / totalPayable;
+      const applied = share > it.payableAmount ? it.payableAmount : share;
+      it.payableAmount = it.payableAmount - applied;
+      it.allocatedDiscount = it.allocatedDiscount + applied;
+      remaining = remaining - applied;
     }
   }
 
