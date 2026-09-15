@@ -34,6 +34,7 @@ import { OrderStatus, PayChannel, RefundStatus, RefundTarget, RefundType } from 
 import { ErrorCode } from '@/core/errors/errorCodes';
 import { IdGenerator } from '@/core/idGenerator';
 import { withTransaction } from '@/core/transaction';
+import type { CouponService } from '@/services/CouponService';
 import type { FundService } from '@/services/FundService';
 import { RefundService } from '@/services/RefundService';
 import type { StockService } from '@/services/StockService';
@@ -146,6 +147,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
   let fundService: {
     recordBalanceRefund: jest.Mock<AnyAsyncFn>;
   };
+  let couponService: { restoreByOrderNo: jest.Mock<AnyAsyncFn> };
   let svc: RefundService;
 
   beforeEach(() => {
@@ -182,6 +184,7 @@ describe('退款领域层 RefundService（T080-A）', () => {
     fundService = {
       recordBalanceRefund: jest.fn<AnyAsyncFn>(),
     };
+    couponService = { restoreByOrderNo: jest.fn<AnyAsyncFn>() };
 
     (withTransaction as unknown as jest.Mock<AnyAsyncFn>).mockImplementation(
       async (fn: AnyAsyncFn) => fn(TX),
@@ -224,11 +227,13 @@ describe('退款领域层 RefundService（T080-A）', () => {
 
     stockService.refundReturn.mockResolvedValue({ skuId: 101n });
     fundService.recordBalanceRefund.mockResolvedValue({ txGroupNo: TX_GROUP_NO });
+    couponService.restoreByOrderNo.mockResolvedValue(undefined);
 
     svc = new RefundService(
       OUTER as never,
       stockService as unknown as StockService,
       fundService as unknown as FundService,
+      couponService as unknown as CouponService,
     );
   });
 
@@ -578,6 +583,30 @@ describe('退款领域层 RefundService（T080-A）', () => {
     // 退款域只验证「委托确实发生」+「委托入参正确」，避免两套逻辑各自写一遍导致口径漂移。
   });
 
+  it('整单退款(FULL) → 调用 couponService.restoreByOrderNo 一次，入参 (orderNo, refundNo, tx) 且必传 tx（T041 联动）', async () => {
+    await svc.execute(REFUND_NO);
+
+    expect(couponService.restoreByOrderNo).toHaveBeenCalledTimes(1);
+    const [orderNoArg, refundNoArg, txArg] = couponService.restoreByOrderNo.mock
+      .calls[0] as [string, string, unknown];
+    expect(orderNoArg).toBe('SO20260910000000000001');
+    expect(refundNoArg).toBe(REFUND_NO);
+    // 漏传 tx = 券状态跑独立连接，事务 C 回滚时券已还 = 一券多用（资损）
+    expect(txArg).toBe(TX);
+    // 返还发生在退款记账之后、同一事务内（restoreByOrderNo 在 recordBalanceRefund 之后被调用）
+    const restoreOrder = (couponService.restoreByOrderNo.mock.invocationCallOrder[0] ?? 0);
+    const fundOrder = (fundService.recordBalanceRefund.mock.invocationCallOrder[0] ?? 0);
+    expect(restoreOrder).toBeGreaterThan(fundOrder);
+  });
+
+  it('部分退款(PARTIAL) → 绝不调用 restoreByOrderNo（一期一单一券，部分退不退券）', async () => {
+    TX.refund.findUnique.mockResolvedValue(makeRefund({ type: RefundType.PARTIAL }));
+
+    await svc.execute(REFUND_NO);
+
+    expect(couponService.restoreByOrderNo).not.toHaveBeenCalled();
+  });
+
   it('recordBalanceRefund 抛错（如平台现金账户缺失）向上传播 → 异常穿透 execute，绝不伪装成退款成功', async () => {
     await svc.execute(REFUND_NO);
     expect(fundService.recordBalanceRefund).toHaveBeenCalledTimes(1);
@@ -752,6 +781,8 @@ describe('退款领域层 RefundService（T080-A）', () => {
     expect(TX.payment.updateMany).not.toHaveBeenCalled();
     expect(TX.orderItem.updateMany).not.toHaveBeenCalled();
     expect(stockService.refundReturn).not.toHaveBeenCalled();
+    // 渠道退款中止时绝不许返还券（券状态亦不变）
+    expect(couponService.restoreByOrderNo).not.toHaveBeenCalled();
   });
 
   it('recordBalanceRefund 抛错 → 向上传播（绝不能被吞成「退款成功」）', async () => {

@@ -59,6 +59,7 @@ import { IdGenerator } from '@/core/idGenerator';
 import { logWarn } from '@/core/logger/logger';
 import { getPrisma } from '@/core/prisma';
 import { withTransaction } from '@/core/transaction';
+import { CouponService } from '@/services/CouponService';
 import { FundService, type TxClient } from '@/services/FundService';
 import { StockService } from '@/services/StockService';
 
@@ -182,20 +183,25 @@ export class RefundService {
   private readonly stockService: StockService;
   /** 资金服务（执行退款时写三条流水） */
   private readonly fundService: FundService;
+  /** 优惠券服务（整单退款时返还券，T041 联动） */
+  private readonly couponService: CouponService;
 
   /**
    * @param prisma Prisma 客户端，缺省取全局单例
    * @param stockService 库存服务，缺省新建
    * @param fundService 资金服务，缺省新建
+   * @param couponService 优惠券服务，缺省新建
    */
   constructor(
     prisma: DbClient = getPrisma(),
     stockService: StockService = new StockService(),
     fundService: FundService = new FundService(),
+    couponService: CouponService = new CouponService(),
   ) {
     this.prisma = prisma;
     this.stockService = stockService;
     this.fundService = fundService;
+    this.couponService = couponService;
   }
 
   /**
@@ -392,6 +398,7 @@ export class RefundService {
    *   4. 逐退款行累加 `order_items.refunded_quantity/amount` + 库存 `refundReturn`
    *   5. `payments` SUCCESS → REFUNDED
    *   6. 记账（BALANCE 三条流水 / CHANNEL 中止）
+   *   6.5 整单退款返还券（仅 FULL：USED → UNUSED，T041 联动，必传 tx）
    *   7. 幂等记录收尾（TODO：T080-B）
    *
    * ⚠️ 渠道退款（`refundTo=CHANNEL`）的分支判定被**提前到步骤 1 之后、步骤 2 之前**：
@@ -495,6 +502,14 @@ export class RefundService {
           },
           tx,
         );
+
+        // ---------- 步骤 6.5：整单退款返还券（T041 联动）----------
+        // 仅整单退款(FULL)调用：USED → UNUSED，把券还给用户（一期一单一券，部分退款不退券）。
+        // 必须传 tx：与退款出账同事务，漏传会让券状态跑独立连接 → 事务回滚时券已还 = 一券多用。
+        // restoreByOrderNo 自身幂等（非 USED / 无记录跳过），重复执行安全。
+        if (refund.type === RefundType.FULL) {
+          await this.couponService.restoreByOrderNo(order.orderNo, refund.refundNo, tx);
+        }
 
         // ---------- 步骤 7：幂等记录收尾 ----------
         // TODO(T080-B)：IdempotencyService 接入后在此把 scope=REFUND_EXEC / key=REFUND_EXEC:{refundNo}
