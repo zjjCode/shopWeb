@@ -49,7 +49,9 @@ interface SkuShape {
   price: bigint;
   status: SkuStatus;
   deletedAt: Date | null;
-  product: { status: ProductStatus; deletedAt: Date | null };
+  imageUrl: string | null;
+  specDigest: string;
+  product: { name: string; mainImage: string; status: ProductStatus; deletedAt: Date | null };
   stock: { available: number } | null;
 }
 
@@ -147,7 +149,9 @@ function buildSku(over: Partial<SkuShape> = {}): SkuShape {
     price: 1000n,
     status: SkuStatus.ENABLED,
     deletedAt: null,
-    product: { status: ProductStatus.ON_SALE, deletedAt: null },
+    imageUrl: 'https://cdn.example.com/sku/1.jpg',
+    specDigest: '颜色:陨石黑|版本:8G+128G',
+    product: { name: '测试商品', mainImage: 'https://cdn.example.com/p/1.jpg', status: ProductStatus.ON_SALE, deletedAt: null },
     stock: { available: 100 },
     ...over,
   };
@@ -166,7 +170,9 @@ function listRow(over: Partial<{
     price: bigint;
     status: SkuStatus;
     deletedAt: Date | null;
-    product: { status: ProductStatus; deletedAt: Date | null };
+    imageUrl: string | null;
+    specDigest: string;
+    product: { name: string; mainImage: string; status: ProductStatus; deletedAt: Date | null };
     stock: { available: number } | null;
   };
 }> = {}): {
@@ -183,7 +189,9 @@ function listRow(over: Partial<{
     price: bigint;
     status: SkuStatus;
     deletedAt: Date | null;
-    product: { status: ProductStatus; deletedAt: Date | null };
+    imageUrl: string | null;
+    specDigest: string;
+    product: { name: string; mainImage: string; status: ProductStatus; deletedAt: Date | null };
     stock: { available: number } | null;
   };
 } {
@@ -201,7 +209,9 @@ function listRow(over: Partial<{
       price: 1000n,
       status: SkuStatus.ENABLED,
       deletedAt: null,
-      product: { status: ProductStatus.ON_SALE, deletedAt: null },
+      imageUrl: 'https://cdn.example.com/sku/1.jpg',
+      specDigest: '颜色:陨石黑|版本:8G+128G',
+      product: { name: '测试商品', mainImage: 'https://cdn.example.com/p/1.jpg', status: ProductStatus.ON_SALE, deletedAt: null },
       stock: { available: 100 },
     },
     ...over,
@@ -214,7 +224,9 @@ function invalidSkuShape(reason: CartInvalidReason): {
   price: bigint;
   status: SkuStatus;
   deletedAt: Date | null;
-  product: { status: ProductStatus; deletedAt: Date | null };
+  imageUrl: string | null;
+  specDigest: string;
+  product: { name: string; mainImage: string; status: ProductStatus; deletedAt: Date | null };
   stock: { available: number } | null;
 } {
   const base = buildSku();
@@ -224,7 +236,7 @@ function invalidSkuShape(reason: CartInvalidReason): {
     case 'SKU_DISABLED':
       return { ...base, status: SkuStatus.DISABLED };
     case 'PRODUCT_OFF_SALE':
-      return { ...base, product: { status: ProductStatus.OFF_SALE, deletedAt: null } };
+      return { ...base, product: { ...base.product, status: ProductStatus.OFF_SALE, deletedAt: null } };
     case 'STOCK_NOT_ENOUGH':
       return { ...base, stock: { available: 1 } };
     default:
@@ -354,7 +366,9 @@ describe('CartService.addItem', () => {
   it('商品下架 → 抛 PRODUCT_NOT_FOUND（21001），且没有写入', async () => {
     const svc = makeSvc();
     fakePrisma.sku.findUnique.mockResolvedValue(
-      buildSku({ product: { status: ProductStatus.OFF_SALE, deletedAt: null } }),
+      buildSku({
+        product: { name: '测试商品', mainImage: 'https://cdn.example.com/p/1.jpg', status: ProductStatus.OFF_SALE, deletedAt: null },
+      }),
     );
 
     await expect(svc.addItem(1n, 1n, 1)).rejects.toMatchObject({ code: ErrorCode.PRODUCT_NOT_FOUND });
@@ -446,6 +460,46 @@ describe('CartService.listWithValidation', () => {
 
     const { totalAmount } = await svc.listWithValidation(1n);
     expect(totalAmount).toBe(2000n);
+  });
+
+  it('视图携带商品名/图/规格：image 优先 SKU 图，回退商品主图', async () => {
+    const svc = makeSvc();
+    const withSkuImage = listRow({
+      id: 1n,
+      sku: buildSku({
+        imageUrl: 'https://cdn.example.com/sku/9.jpg',
+        specDigest: '颜色:远峰蓝|版本:12G+256G',
+        product: {
+          name: 'iPhone 15',
+          mainImage: 'https://cdn.example.com/p/9.jpg',
+          status: ProductStatus.ON_SALE,
+          deletedAt: null,
+        },
+      }),
+    });
+    fakePrisma.cartItem.findMany.mockResolvedValue([withSkuImage]);
+
+    const { valid } = await svc.listWithValidation(1n);
+    expect(valid[0]?.name).toBe('iPhone 15');
+    expect(valid[0]?.spec).toBe('颜色:远峰蓝|版本:12G+256G');
+    expect(valid[0]?.image).toBe('https://cdn.example.com/sku/9.jpg'); // SKU 图优先
+
+    // 无 SKU 图时回退商品主图
+    const withProductImage = listRow({
+      id: 2n,
+      sku: buildSku({
+        imageUrl: null,
+        product: {
+          name: '小米 14',
+          mainImage: 'https://cdn.example.com/p/14.jpg',
+          status: ProductStatus.ON_SALE,
+          deletedAt: null,
+        },
+      }),
+    });
+    fakePrisma.cartItem.findMany.mockResolvedValue([withProductImage]);
+    const { valid: v2 } = await svc.listWithValidation(1n);
+    expect(v2[0]?.image).toBe('https://cdn.example.com/p/14.jpg'); // 回退主图
   });
 });
 

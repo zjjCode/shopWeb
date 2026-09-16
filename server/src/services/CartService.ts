@@ -81,6 +81,12 @@ export interface CartItemView {
   invalidReason: CartInvalidReason | null;
   /** 当前价 != 快照价（提示「价格已变动」） */
   priceChanged: boolean;
+  /** 商品名称（来自 products.name） */
+  name: string;
+  /** 展示图：SKU 级 imageUrl 优先，回退商品主图 mainImage */
+  image: string;
+  /** 规格摘要（如「颜色:陨石黑|版本:8G+128G」），用于购物车行展示 */
+  spec: string;
 }
 
 /** 列表返回：有效 / 失效分组 + 仅勾选且有效项的合计（分） */
@@ -243,6 +249,9 @@ export class CartService {
         invalid: invalidReason !== null,
         invalidReason,
         priceChanged,
+        name: product.name,
+        image: sku.imageUrl ?? product.mainImage,
+        spec: sku.specDigest,
       };
 
       if (invalidReason !== null) {

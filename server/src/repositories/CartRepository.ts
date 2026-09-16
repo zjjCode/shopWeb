@@ -60,7 +60,11 @@ export type CartItemListRow = Prisma.CartItemGetPayload<{
         price: true;
         status: true;
         deletedAt: true;
-        product: { select: { status: true; deletedAt: true } };
+        /** SKU 级图片（优先展示，可空时回退商品主图） */
+        imageUrl: true;
+        /** 规格摘要（如「颜色:陨石黑|版本:8G+128G」），用于购物车行展示 */
+        specDigest: true;
+        product: { select: { status: true; deletedAt: true; name: true; mainImage: true } };
         stock: { select: { available: true } };
       };
     };
@@ -160,7 +164,9 @@ export class CartRepository {
             price: true,
             status: true,
             deletedAt: true,
-            product: { select: { status: true, deletedAt: true } },
+            imageUrl: true,
+            specDigest: true,
+            product: { select: { status: true, deletedAt: true, name: true, mainImage: true } },
             stock: { select: { available: true } },
           },
         },

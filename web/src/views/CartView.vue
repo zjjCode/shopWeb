@@ -97,8 +97,10 @@ onMounted(() => {
         </div>
         <div v-for="item in cart.validItems" :key="item.id" class="cart-item" :class="{ off: item.priceChanged }">
           <el-checkbox :model-value="item.selected" @change="toggleSelect(item)" />
+          <img v-if="item.image" :src="item.image" class="item-thumb" alt="" />
           <div class="item-main">
-            <div class="item-name">SKU #{{ item.skuId }}</div>
+            <div class="item-name">{{ item.name }}</div>
+            <div v-if="item.spec" class="item-spec text-muted">{{ item.spec }}</div>
             <div v-if="item.priceChanged" class="text-muted">价格已更新</div>
           </div>
           <div class="item-price price">{{ formatYuan(item.price) }}</div>
@@ -115,7 +117,8 @@ onMounted(() => {
         </div>
         <div v-for="item in cart.invalidItems" :key="item.id" class="cart-item invalid">
           <div class="item-main">
-            <div class="item-name">SKU #{{ item.skuId }}</div>
+            <div class="item-name">{{ item.name }}</div>
+            <div v-if="item.spec" class="item-spec text-muted">{{ item.spec }}</div>
             <div class="reason text-muted">
               失效原因：{{ item.invalidReason ? invalidReasonText[item.invalidReason] : '未知' }}
             </div>
@@ -167,6 +170,18 @@ onMounted(() => {
 }
 .item-name {
   font-weight: 600;
+}
+.item-spec {
+  font-size: 12px;
+  margin-top: 4px;
+}
+.item-thumb {
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: var(--border);
 }
 .reason {
   font-size: 12px;

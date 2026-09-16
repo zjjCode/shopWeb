@@ -137,6 +137,12 @@ export interface CartItemView {
   invalid: boolean;
   invalidReason: CartInvalidReason | null;
   priceChanged: boolean;
+  /** 商品名称 */
+  name: string;
+  /** 展示图（SKU 图优先，回退商品主图） */
+  image: string;
+  /** 规格摘要（如「颜色:陨石黑|版本:8G+128G」） */
+  spec: string;
 }
 export interface CartListResult {
   valid: CartItemView[];
