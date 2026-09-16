@@ -20,9 +20,10 @@
  */
 
 import type { Request, Response } from 'express';
-import { sendOk } from '@/core/response';
+import { sendOk, sendPaged } from '@/core/response';
 import { orderService } from '@/services/OrderService';
-import type { CreateOrderInput } from '@/validators/order.validator';
+import { normalizePaging, type RawPagingQuery } from '@/utils/paging';
+import type { CreateOrderInput, OrderListQuery } from '@/validators/order.validator';
 
 /**
  * 取当前登录用户的 ID（bigint）。
@@ -90,6 +91,40 @@ export class OrderController {
     const { orderNo } = req.params as { orderNo: string };
     await orderService.confirmReceipt(currentUserId(req), orderNo);
     sendOk(res, { orderNo, completed: true });
+  }
+
+  /**
+   * 订单列表（分页，C 端「我的订单」）。
+   *
+   * @description 入参两来源皆是转换后的值：`req.query`（validate 回写，status 已校验为合法枚举）
+   * 与 `req.pagination`（pagination 中间件归一化的 `{ page, pageSize, skip, take }`）。
+   * 缺失分页时以 normalizePaging 兜底，保证参数安全。越权防护在 service 层以 userId 兜底。
+   * @param req Express 请求
+   * @param res Express 响应
+   */
+  async list(req: Request, res: Response): Promise<void> {
+    const query = req.query as unknown as OrderListQuery;
+    const paging = req.pagination ?? normalizePaging(req.query as RawPagingQuery);
+
+    const result = await orderService.listOrders(currentUserId(req), {
+      status: query.status,
+      page: paging.page,
+      pageSize: paging.pageSize,
+    });
+    sendPaged(res, result.list, result.total, paging.page, paging.pageSize);
+  }
+
+  /**
+   * 订单详情（C 端「订单详情」页）。
+   *
+   * @description orderNo 来自路由参数，越权/缺单由 service 抛 31001（404）。
+   * @param req Express 请求
+   * @param res Express 响应
+   */
+  async detail(req: Request, res: Response): Promise<void> {
+    const { orderNo } = req.params as { orderNo: string };
+    const data = await orderService.getOrderDetail(currentUserId(req), orderNo);
+    sendOk(res, data);
   }
 }
 

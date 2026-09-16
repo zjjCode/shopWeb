@@ -84,6 +84,110 @@ export interface CreateOrderResult {
   expireAt: Date;
 }
 
+/** 订单列表项中的订单行摘要（C 端「我的订单」首屏展示用） */
+export interface OrderItemSummary {
+  /** 商品名（下单时快照） */
+  productName: string;
+  /** 规格摘要（如「颜色:陨石黑 内存:256G」） */
+  specDigest: string;
+  /** 主图 URL */
+  mainImage: string;
+  /** 成交单价（分，bigint） */
+  unitPrice: bigint;
+  /** 数量 */
+  quantity: number;
+}
+
+/** 订单列表项（C 端「我的订单」列表） */
+export interface OrderSummary {
+  /** 订单号 */
+  orderNo: string;
+  /** 订单状态 */
+  status: OrderStatus;
+  /** 应付金额（分，bigint） */
+  payAmount: bigint;
+  /** 订单行数量（= items.length） */
+  itemCount: number;
+  /** 首图（取首行的 mainImage，没有则为 null） */
+  thumbnail: string | null;
+  /** 下单时间 */
+  createdAt: Date;
+  /** 订单行摘要（取该订单全部订单行，通常 < 10） */
+  items: OrderItemSummary[];
+}
+
+/** 订单列表返回（与 `sendPaged` 的 PageResult 对齐，但字段按领域语义命名） */
+export interface OrderListResult {
+  /** 当前页订单 */
+  list: OrderSummary[];
+  /** 总条数 */
+  total: number;
+  /** 当前页码 */
+  page: number;
+  /** 每页条数 */
+  pageSize: number;
+  /** 总页数（至少 1） */
+  totalPages: number;
+}
+
+/** 订单详情中的订单行（含 payableAmount，对账/退款用） */
+export interface OrderDetailItem {
+  /** SKU 编码 */
+  skuCode: string;
+  /** 商品名（快照） */
+  productName: string;
+  /** 规格摘要 */
+  specDigest: string;
+  /** 主图 URL */
+  mainImage: string;
+  /** 成交单价（分，bigint） */
+  unitPrice: bigint;
+  /** 数量 */
+  quantity: number;
+  /** 本行实付（分，bigint，不含运费） */
+  payableAmount: bigint;
+}
+
+/** 订单详情中的支付单摘要 */
+export interface OrderPaymentSummary {
+  /** 支付方式（可空：充值单等场景） */
+  payMethod: string | null;
+  /** 支付金额（分，bigint） */
+  amount: bigint;
+  /** 支付状态 */
+  status: string;
+  /** 支付成功时间（可空） */
+  paidAt: Date | null;
+}
+
+/** 订单详情中的退款单摘要 */
+export interface OrderRefundSummary {
+  /** 退款单状态 */
+  status: string;
+  /** 退款金额（分，bigint） */
+  amount: bigint;
+  /** 退款类型（FULL / PARTIAL） */
+  type: string;
+}
+
+/** 订单详情（C 端「订单详情」页） */
+export interface OrderDetail {
+  /** 订单号 */
+  orderNo: string;
+  /** 订单状态 */
+  status: OrderStatus;
+  /** 应付金额（分，bigint） */
+  payAmount: bigint;
+  /** 下单时间 */
+  createdAt: Date;
+  /** 订单行 */
+  items: OrderDetailItem[];
+  /** 关联支付单 */
+  payments: OrderPaymentSummary[];
+  /** 关联退款单 */
+  refunds: OrderRefundSummary[];
+}
+
 /** 支付超时时长（分钟）：与 F5「expire_at = NOW() + 30min」一致 */
 const PAY_TIMEOUT_MINUTES = 30;
 
@@ -581,6 +685,164 @@ export class OrderService {
    * @description `WHERE status='SHIPPED' AND auto_confirm_at < NOW()`，走 `idx_status_autoconfirm` 索引；
    * 按 `id` 升序分页。`LIMIT` 由调用方传入（默认 500）。
    * @param limit 单批上限
+  /**
+   * 查询当前用户的订单列表（C 端「我的订单」）。
+   *
+   * @description 越权防护：查询 `where` 强制带 `userId`，软删（`deletedAt`）订单不返回；
+   * `status` 可选，传了则按状态过滤（枚举值已由校验层保证合法）。
+   * 排序：下单时间倒序、主键倒序——保证分页稳定，避免同毫秒订单乱序翻页。
+   * 列表项只取首行主图作缩略图，订单行全量返回（通常 < 10）以满足首屏展示。
+   * @param userId 用户 ID（只从 `req.auth` 取，绝不从 body 读）
+   * @param params 过滤与分页参数（status 可选；page/pageSize 已由 `pagination()` 归一化）
+   * @returns 当前页订单摘要 + 总条数 + 总页数
+   */
+  async listOrders(
+    userId: bigint,
+    params: { status?: OrderStatus; page: number; pageSize: number },
+  ): Promise<OrderListResult> {
+    const { status, page, pageSize } = params;
+    const where: Prisma.OrderWhereInput = {
+      userId,
+      deletedAt: null,
+      ...(status ? { status } : {}),
+    };
+    const orderBy: Prisma.OrderOrderByWithRelationInput = { createdAt: 'desc', id: 'desc' };
+
+    const [total, rows] = await Promise.all([
+      this.prisma.order.count({ where }),
+      this.prisma.order.findMany({
+        where,
+        orderBy,
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        include: {
+          items: {
+            orderBy: { id: 'asc' },
+            select: {
+              productName: true,
+              specDigest: true,
+              mainImage: true,
+              unitPrice: true,
+              quantity: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    const list: OrderSummary[] = rows.map((order) => {
+      const items: OrderItemSummary[] = order.items.map((item) => ({
+        productName: item.productName,
+        specDigest: item.specDigest,
+        mainImage: item.mainImage,
+        unitPrice: item.unitPrice,
+        quantity: item.quantity,
+      }));
+      return {
+        orderNo: order.orderNo,
+        status: order.status,
+        payAmount: order.payAmount,
+        itemCount: items.length,
+        thumbnail: items[0]?.mainImage ?? null,
+        createdAt: order.createdAt,
+        items,
+      };
+    });
+
+    return {
+      list,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    };
+  }
+
+  /**
+   * 查询订单详情（C 端「订单详情」页）。
+   *
+   * @description 越权防护：查询 `where` 强制带 `userId` + 软删过滤，越权或缺单统一抛 31001
+   * （与列表一致，不暴露订单是否存在）。关联支付单、退款单一并查出，避免前端多次往返。
+   * @param userId 用户 ID（只从 `req.auth` 取）
+   * @param orderNo 订单号
+   * @returns 订单详情（含订单行、支付单、退款单）
+   * @throws {BusinessError} 31001 订单不存在 / 不属于该用户
+   */
+  async getOrderDetail(userId: bigint, orderNo: string): Promise<OrderDetail> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderNo, userId, deletedAt: null },
+      include: {
+        items: {
+          orderBy: { id: 'asc' },
+          select: {
+            skuCode: true,
+            productName: true,
+            specDigest: true,
+            mainImage: true,
+            unitPrice: true,
+            quantity: true,
+            payableAmount: true,
+          },
+        },
+        payments: {
+          select: {
+            channel: true,
+            amount: true,
+            status: true,
+            paidAt: true,
+          },
+        },
+        refunds: {
+          select: {
+            status: true,
+            amount: true,
+            type: true,
+          },
+        },
+      },
+    });
+
+    if (!order) {
+      throw new BusinessError('订单不存在', { code: ErrorCode.ORDER_NOT_FOUND, httpStatus: 404 });
+    }
+
+    const items: OrderDetailItem[] = order.items.map((item) => ({
+      skuCode: item.skuCode,
+      productName: item.productName,
+      specDigest: item.specDigest,
+      mainImage: item.mainImage,
+      unitPrice: item.unitPrice,
+      quantity: item.quantity,
+      payableAmount: item.payableAmount,
+    }));
+
+    const payments: OrderPaymentSummary[] = order.payments.map((payment) => ({
+      payMethod: payment.channel,
+      amount: payment.amount,
+      status: payment.status,
+      paidAt: payment.paidAt,
+    }));
+
+    const refunds: OrderRefundSummary[] = order.refunds.map((refund) => ({
+      status: refund.status,
+      amount: refund.amount,
+      type: refund.type,
+    }));
+
+    return {
+      orderNo: order.orderNo,
+      status: order.status,
+      payAmount: order.payAmount,
+      createdAt: order.createdAt,
+      items,
+      payments,
+      refunds,
+    };
+  }
+
+  /**
+   * 待自动确认收货扫描（定时任务调用）。
+   *
    * @returns 待自动确认的订单号列表
    */
   async scanReceivableOrders(limit: number = 500): Promise<string[]> {

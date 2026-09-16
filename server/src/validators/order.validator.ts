@@ -19,6 +19,8 @@
  */
 
 import { z } from 'zod';
+import { OrderStatus } from '@prisma/client';
+import { LIST_RULE } from '@/constants/bizRules';
 
 /** 单次下单的购物车条目数上限（与购物车条目上限一致，保护事务长度） */
 const MAX_ORDER_ITEMS = 100;
@@ -145,3 +147,60 @@ export const shipOrderSchema = z
 
 /** 发货入参类型 */
 export type ShipOrderBody = z.infer<typeof shipOrderSchema>;
+
+/**
+ * query 入参归一化：字符串去空格，空串 → `undefined`（等价于「未传」）。
+ *
+ * @description 与 `product.validator.ts` 同语义：前端拼串时偶发带出空值（如 `?status=`），
+ * 不应被当成「非法枚举」打回，而应等价于「不按状态过滤」
+ * @param value 原始入参
+ * @returns 归一化后的值
+ */
+function normalizeText(value: unknown): unknown {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+/**
+ * 构造分页类正整数参数（page / pageSize）。
+ *
+ * @description 非法值统一由 zod 产出 400；合法缺省时回退默认分页（与列表读接口的严格策略一致）
+ * @param label 中文名，用于错误文案
+ * @param max 允许的最大值
+ * @param defaultValue 未传时使用的值
+ * @returns zod schema（输出 number）
+ */
+function positiveInt(label: string, max: number, defaultValue: number) {
+  return z.preprocess(
+    normalizeText,
+    z.coerce
+      .number()
+      .int(`${label}必须是整数`)
+      .min(1, `${label}必须大于 0`)
+      .max(max, `${label}不可超过 ${max}`)
+      .default(defaultValue),
+  );
+}
+
+/**
+ * 订单列表查询（query）：GET /api/orders
+ *
+ * @description `page` / `pageSize` 必须进 schema（严格未知字段 400），
+ * 这样 `validate` 先于 `pagination()` 跑时，`pagination()` 才能读到转换后的 number。
+ * `status` 可选，传了则按合法 `OrderStatus` 枚举过滤（非法枚举直接 400）。
+ * @see src/routes/api/product.routes.ts（同款中间件顺序与严格策略）
+ */
+export const orderListQuerySchema = z
+  .object({
+    page: positiveInt('页码', 1_000_000, LIST_RULE.DEFAULT_PAGE),
+    pageSize: positiveInt('每页条数', LIST_RULE.MAX_PAGE_SIZE, LIST_RULE.DEFAULT_PAGE_SIZE),
+    /** 订单状态过滤：空串等价于不传；非法枚举 400 */
+    status: z.preprocess(normalizeText, z.nativeEnum(OrderStatus).optional()),
+  })
+  .strict();
+
+/** 订单列表查询类型（校验并回写后的形态） */
+export type OrderListQuery = z.infer<typeof orderListQuerySchema>;

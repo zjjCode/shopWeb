@@ -29,11 +29,13 @@ import { orderController } from '@/controllers/OrderController';
 import { asyncHandler } from '@/middlewares/asyncHandler';
 import { auth } from '@/middlewares/auth';
 import { idempotency } from '@/middlewares/idempotency';
+import { pagination } from '@/middlewares/pagination';
 import { rateLimit } from '@/middlewares/rateLimit';
 import { validate } from '@/middlewares/validate';
 import {
   cancelOrderSchema,
   createOrderSchema,
+  orderListQuerySchema,
   orderNoParamSchema,
 } from '@/validators/order.validator';
 
@@ -48,6 +50,20 @@ function orderCreateRateLimit() {
     max: RATE_LIMIT_PRESETS.ORDER_CREATE.max,
     prefix: RATE_LIMIT_KEY.ROUTE,
     message: '下单过于频繁，请稍后再试',
+  });
+}
+
+/**
+ * 订单读接口限流：IP/路由维度 120 次/分钟（与商品列表读接口一致，避免单 IP 刷爆数据库）。
+ *
+ * @returns 限流中间件
+ */
+function defaultRateLimit() {
+  return rateLimit({
+    windowMs: RATE_LIMIT_PRESETS.DEFAULT.windowMs,
+    max: RATE_LIMIT_PRESETS.DEFAULT.max,
+    prefix: RATE_LIMIT_KEY.ROUTE,
+    message: '请求过于频繁，请稍后再试',
   });
 }
 
@@ -85,6 +101,25 @@ export function createOrderRouter(): Router {
     orderCreateRateLimit(),
     validate({ params: orderNoParamSchema }),
     asyncHandler(orderController.confirm),
+  );
+
+  // 订单列表（分页读）：validate 先跑（写回 number 的 page/pageSize），pagination 才能拿到
+  router.get(
+    '/orders',
+    auth({ scope: 'shop' }),
+    defaultRateLimit(),
+    validate({ query: orderListQuerySchema }),
+    pagination(),
+    asyncHandler(orderController.list),
+  );
+
+  // 订单详情：路径参数 orderNo（越权/缺单由 service 抛 31001 → 404）
+  router.get(
+    '/orders/:orderNo',
+    auth({ scope: 'shop' }),
+    defaultRateLimit(),
+    validate({ params: orderNoParamSchema }),
+    asyncHandler(orderController.detail),
   );
 
   return router;
