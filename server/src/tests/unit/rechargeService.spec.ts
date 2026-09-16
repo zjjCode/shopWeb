@@ -145,10 +145,10 @@ describe('RechargeService 创建充值单', () => {
     expect(payArg.data.status).toBe(PayStatus.PENDING);
     expect(payArg.data.expireAt).toBe(roArg.data.expireAt);
 
-    // 返回结构：payUrl 为 mock 收银台占位，携带支付单号
+    // 返回结构：payUrl 为渠道化收银台（经 PaymentRouter），携带支付单号与渠道标识
     expect(r.rechargeNo).toBe(roArg.data.rechargeNo);
     expect(r.paymentNo).toBe(payArg.data.paymentNo);
-    expect(r.payUrl).toBe(`/mock-pay?paymentNo=${r.paymentNo}`);
+    expect(r.payUrl).toBe(`/mock-pay/alipay?paymentNo=${r.paymentNo}`);
     expect(r.amount).toBe(10_000n);
     expect(r.expireAt).toBe(roArg.data.expireAt);
   });

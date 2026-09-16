@@ -57,6 +57,7 @@ import { logWarn } from '@/core/logger/logger';
 import { getPrisma } from '@/core/prisma';
 import { withTransaction } from '@/core/transaction';
 import { FundService, type TxClient } from '@/services/FundService';
+import { buildChannelPayUrl } from '@/services/payment/paymentRouter';
 import { StockService } from '@/services/StockService';
 
 /** 本服务用到的 Prisma 委托（单测注入假实现时只需实现这些） */
@@ -816,23 +817,18 @@ export class PaymentService {
   }
 
   /**
-   * 生成收银台地址。
+   * 生成收银台地址（经 PaymentRouter，F6.5）。
    *
-   * @description 本期只实现 MOCK 渠道：返回前端收银台 `/payment/{paymentNo}`。
-   * 真实渠道不在此处硬编码 —— 由 `PaymentRouter` 按 `payMethod` 分发适配器，
-   * 调 `adapter.createPayment({paymentNo, amount, subject, expireAt, notifyUrl})` 拿托管页 / 二维码（F6.5）。
+   * @description 不再手写硬编码与空串：统一委托 {@link buildChannelPayUrl} 按 `channel` 路由。
+   * 一期所有渠道走 `MockPaymentAdapter`——MOCK → 前端收银台 `/payment/{paymentNo}`；
+   * ALIPAY/WECHAT/BANKCARD → 带渠道标识的 mock 收银台 `/mock-pay/{channel}?paymentNo=...`。
+   * 真实渠道适配器注册进 `resolvePaymentAdapter` 后即自动生效，本方法零改动（T061 收口）。
    * @param paymentNo 支付单号
    * @param channel 支付渠道
-   * @returns 收银台地址；未实现的渠道返回空串（由上层决定降级策略）
+   * @returns 收银台地址
    */
   private buildPayUrl(paymentNo: string, channel: PayChannel): string {
-    if (channel === PayChannel.MOCK) {
-      return `/payment/${paymentNo}`;
-    }
-    // TODO(T061)：接入 PaymentRouter（F6.5）——
-    // const adapter = paymentRouter.resolve(channel); if (adapter === null) → 余额支付分支（F6.6）；
-    // 否则 return adapter.createPayment({...}).payUrl。禁止静默 fallback 到 mock（§6.7）。
-    return '';
+    return buildChannelPayUrl(channel, { paymentNo });
   }
 }
 

@@ -374,14 +374,14 @@ describe('PaymentService 支付（发起 + 入账事务 B）', () => {
     expect(prisma.payment.create).not.toHaveBeenCalled();
   });
 
-  it('MOCK 渠道 payUrl 为前端收银台；非 MOCK 渠道本期留空（待 PaymentRouter 接入）', async () => {
+  it('MOCK 渠道 payUrl 为前端收银台；非 MOCK 渠道走 PaymentRouter 生成渠道化地址', async () => {
     const mockResult = await svc.createPayment(1n, baseInput);
     expect(mockResult.payUrl).toBe(`/payment/${mockResult.paymentNo}`);
 
-    // 换 ALIPAY 再发一次：本期未接适配器，payUrl 为空串而非伪造地址
+    // 换 ALIPAY 再发一次：PaymentRouter 已接入，返回带渠道标识的 mock 收银台（非空、非伪造前端地址）
     prisma.order.findFirst.mockResolvedValue(makeOrder());
     const aliResult = await svc.createPayment(1n, { orderNo: baseInput.orderNo, payMethod: PayChannel.ALIPAY });
-    expect(aliResult.payUrl).toBe('');
+    expect(aliResult.payUrl).toBe(`/mock-pay/alipay?paymentNo=${aliResult.paymentNo}`);
   });
 
   // --------------------------------------------------------------------------

@@ -55,9 +55,10 @@ export class PaymentController {
    * 响应体：`{ paymentNo, payUrl, amount, expireAt }`。其中 `amount` 是 bigint（分），
    * 依赖 `app.set('json replacer', jsonReplacer)` 才能正常序列化——未接线时 Express 会直接 500。
    *
-   * ⚠️ 非 MOCK 渠道下 `payUrl` 会是**空串**（T061 接入 `PaymentRouter` 后才有真实地址）。
-   * 收银台页面必须能处理空串，不要直接 `location.href = payUrl`——那会跳到当前页，
-   * 表现为「点了支付没反应」。本期 `payMethod` 只允许 MOCK，该路径暂不可达。
+   * ⚠️ `payUrl` 由 `PaymentRouter`（F6.5）按 `payMethod` 路由生成，不再是空串：MOCK → 前端收银台
+   * `/payment/{paymentNo}`；真实渠道（ALIPAY/WECHAT/BANKCARD）一期返回带渠道标识的 mock 收银台
+   * `/mock-pay/{channel}?paymentNo=...`。收银台页面应按渠道展示对应收银台，不要假定 URL 形态固定。
+   * 本期 HTTP 下单支付 `payMethod` 仍只允许 MOCK（订单支付校验器限制），真实渠道地址主要供充值链路使用。
    *
    * @param req Express 请求（body 已由 validate 校验）
    * @param res Express 响应

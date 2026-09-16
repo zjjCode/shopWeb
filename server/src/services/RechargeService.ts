@@ -30,6 +30,7 @@ import { ValidationError } from '@/core/errors';
 import { ErrorCode } from '@/core/errors/errorCodes';
 import { paymentNo as generatePaymentNo, rechargeNo as generateRechargeNo } from '@/core/idGenerator';
 import { withTransaction } from '@/core/transaction';
+import { buildChannelPayUrl } from '@/services/payment/paymentRouter';
 
 /** 充值支付方式（与 `balance.validator.ts` 的 RECHARGE_PAY_METHODS 白名单一致） */
 export type RechargePayMethod = 'ALIPAY' | 'WECHAT' | 'BANKCARD';
@@ -144,7 +145,7 @@ export class RechargeService {
     const rechargeNo = generateRechargeNo();
     const paymentNo = generatePaymentNo();
     const expireAt = new Date(Date.now() + RECHARGE_EXPIRE_MINUTES * 60 * 1000);
-    const payUrl = this.buildPayUrl(paymentNo);
+    const payUrl = this.buildPayUrl(paymentNo, channel);
 
     // 两表写入必须同一事务（F14.1 ①）：任何一张失败整体回滚，不留半张充值单
     const recharge = await tx.rechargeOrder.create({
@@ -181,15 +182,20 @@ export class RechargeService {
   }
 
   /**
-   * mock 收银台地址（占位）。
+   * 渠道化收银台地址（经 PaymentRouter）。
    *
-   * @description 本期占位：前端跳 `/mock-pay?paymentNo=xxx` 即可走通「创建充值单 → 拉起支付」
-   * 的链路。TODO(T070-C)：接入 PaymentAdapter 托管收银台（F14.1 ①），替换为真实渠道 payUrl。
+   * @description 不再硬编码 `/mock-pay?paymentNo=`，而是按 `channel` 走 {@link buildChannelPayUrl}
+   * （F6.5 渠道路由）：MOCK → `/payment/{paymentNo}`；ALIPAY/WECHAT/BANKCARD →
+   * `/mock-pay/{channel}?paymentNo=...`。这是「充值实际支付链路（CHANNEL）一期未接」收口的关键一步
+   * —— 充值单从此携带真实渠道标识的收银台地址，配合 `PaymentService.handlePaidNotify` 的
+   * `settleRecharge` 入账，整条链路在 mock 模式下按渠道贯通。
+   * 真实渠道接入时只需在 `resolvePaymentAdapter` 注册 `RealPaymentAdapter`，本方法零改动。
    * @param paymentNo 支付单号
-   * @returns 占位收银台地址
+   * @param channel 支付渠道（ALIPAY / WECHAT / BANKCARD / MOCK）
+   * @returns 渠道化收银台地址
    */
-  private buildPayUrl(paymentNo: string): string {
-    return `/mock-pay?paymentNo=${paymentNo}`;
+  private buildPayUrl(paymentNo: string, channel: PayChannel): string {
+    return buildChannelPayUrl(channel, { paymentNo });
   }
 
   /**
