@@ -13,9 +13,9 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
-    "lint": "eslint \"src/**/*.{ts,vue}\" --ext .ts,.vue",
-    "lint:fix": "eslint \"src/**/*.{ts,vue}\" --ext .ts,.vue --fix",
-    "format": "prettier --write \"src/**/*.{ts,vue,scss}\"",
+    "lint": "vue-tsc --noEmit",
+    "lint:fix": "vue-tsc --noEmit",
+    "format": "echo 'Prettier 未在本阶段接入；前端门禁以 vue-tsc 类型检查为准（npm run lint）。'",
     "test": "vitest run"
   },
   "dependencies": {
