@@ -30,7 +30,7 @@ import { ValidationError } from '@/core/errors';
 import { ErrorCode } from '@/core/errors/errorCodes';
 import { paymentNo as generatePaymentNo, rechargeNo as generateRechargeNo } from '@/core/idGenerator';
 import { withTransaction } from '@/core/transaction';
-import { buildChannelPayUrl } from '@/services/payment/paymentRouter';
+import { buildConfiguredPayUrl } from '@/services/payment/configuredPaymentAdapter';
 
 /** 充值支付方式（与 `balance.validator.ts` 的 RECHARGE_PAY_METHODS 白名单一致） */
 export type RechargePayMethod = 'ALIPAY' | 'WECHAT' | 'BANKCARD';
@@ -195,7 +195,7 @@ export class RechargeService {
    * @returns 渠道化收银台地址
    */
   private buildPayUrl(paymentNo: string, channel: PayChannel): string {
-    return buildChannelPayUrl(channel, { paymentNo });
+    return buildConfiguredPayUrl(channel, { paymentNo });
   }
 
   /**

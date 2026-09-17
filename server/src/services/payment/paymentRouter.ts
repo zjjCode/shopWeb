@@ -54,7 +54,7 @@ export interface PaymentAdapter {
  * 真实渠道返回带渠道标识的 mock 收银台 `/mock-pay/{channel}?paymentNo=...`。
  * 显式带渠道前缀是 §6.7 红线要求——**不**把真实渠道伪装成 MOCK 前端收银台。
  */
-class MockPaymentAdapter implements PaymentAdapter {
+export class MockPaymentAdapter implements PaymentAdapter {
   readonly channel: PayChannel;
 
   constructor(channel: PayChannel) {

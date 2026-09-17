@@ -51,12 +51,12 @@ import {
 import {
   BusinessError,
   ConflictError,
-  ExternalServiceError,
   NotFoundError,
 } from '@/core/errors';
 import { ErrorCode } from '@/core/errors/errorCodes';
+import { config } from '@/config';
+import { resolveRefundAdapter } from '@/services/payment/refundAdapter';
 import { IdGenerator } from '@/core/idGenerator';
-import { logWarn } from '@/core/logger/logger';
 import { getPrisma } from '@/core/prisma';
 import { withTransaction } from '@/core/transaction';
 import { CouponService } from '@/services/CouponService';
@@ -141,6 +141,8 @@ type ExecutingRefund = {
   type: RefundType;
   amount: bigint;
   refundTo: RefundTarget;
+  /** 关联支付单号（渠道退款原路退回的对账锚点，可空） */
+  paymentNo: string | null;
 };
 
 /** 执行退款时需要的订单字段 */
@@ -150,6 +152,8 @@ type ExecutingOrder = {
   status: OrderStatus;
   payAmount: bigint;
   refundedAmount: bigint;
+  /** 订单支付方式（CHANNEL 退款路由锚点：BALANCE→余额，其余→原路退渠道） */
+  payMethod: PayChannel | null;
 };
 
 /** 可申请退款的订单状态集合（F9.1 ①） */
@@ -202,6 +206,18 @@ export class RefundService {
     this.stockService = stockService;
     this.fundService = fundService;
     this.couponService = couponService;
+  }
+
+  /**
+   * 当前配置的支付 provider（缺口 #3 渠道退款路由用）。
+   *
+   * @description 从 `config.adapter.payment.provider` 读取；缺省或显式为 `mock` 时走
+   * {@link MockRefundAdapter}（抛 41004 中止），其余（`alipay` / `wechat` / `unionpay`）
+   * 走 {@link RealRefundAdapter}（凭据缺失抛错）。必须带 `?? 'mock'` 兜底——
+   * 部分 config mock 桩未声明 `adapter`，缺省归 mock 才能与既有行为规范一致。
+   */
+  private get paymentProvider(): string {
+    return config.adapter?.payment?.provider ?? 'mock';
   }
 
   /**
@@ -430,24 +446,33 @@ export class RefundService {
         // 在事务内读退款单（而不是事务外）：拿到的是状态锁之后的数据，避免读到过期快照
         const refund = await this.loadExecutingRefund(tx, refundNo);
 
-        // ---------- 步骤 6（提前）：渠道退款中止 ----------
-        // TODO(T080-B)：接入 PaymentAdapter 后在此调 `adapter.refund({refundNo, paymentNo, amount, reason})`，
-        // 成功拿到 channelRefundNo 再继续下面的订单推进与记账；失败则按 F9.2 写
-        // `status=FAILED` + `fail_reason` + 指数退避 `next_retry_at`，**订单状态不变**。
-        if (refund.refundTo === RefundTarget.CHANNEL) {
-          logWarn('refund.channel_unsupported', {
-            bizNos: { refundNo, orderNo: refund.orderNo },
-            ctx: { amount: refund.amount.toString() },
-          });
-          throw new ExternalServiceError(
-            '渠道退款未实现：一期缺少 PaymentAdapter，无法确认渠道退款结果',
-            'payment',
-            'channel',
-            { code: ErrorCode.REFUND_EXEC_FAILED },
-          );
-        }
-
+        // 提前读订单：CHANNEL 需按 order.payMethod 路由退款适配器；
+        // BALANCE / CHANNEL 后续步骤都依赖订单字段，统一在分支前读一次。
         const order = await this.loadExecutingOrder(tx, refund.orderId);
+
+        // ---------- 步骤 6（提前）：渠道退款经适配器接缝（缺口 #3）----------
+        // 路由接缝已就位：CHANNEL 原路退回，按 order.payMethod 选渠道退款适配器，
+        // 调 adapter.refund 拿到 channelRefundNo 写回 refunds.channel_refund_no。
+        // 一期 MockRefundAdapter.refund 抛 41004 中止——保留既有「渠道退款未实现」行为：
+        // 整笔回滚、不记账、订单状态不变（F9.2），与既有测试一致。
+        // TODO(T080-B 续)：真实凭据接入（下一批）后 RealRefundAdapter 在此真正调渠道退款 API，
+        // 成功写入 channel_refund_no；失败则按 F9.2 写 `status=FAILED` + `fail_reason` +
+        // 指数退避 `next_retry_at`，**订单状态不变**。本批只接接缝，不接真实网关。
+        if (refund.refundTo === RefundTarget.CHANNEL) {
+          const channel = order.payMethod ?? PayChannel.MOCK;
+          const adapter = resolveRefundAdapter(channel, this.paymentProvider);
+          const result = await adapter.refund({
+            refundNo: refund.refundNo,
+            paymentNo: refund.paymentNo,
+            amount: refund.amount,
+            channel,
+            reason: '用户申请退款',
+          });
+          await tx.refund.updateMany({
+            where: { refundNo: refund.refundNo, status: RefundStatus.SUCCESS },
+            data: { channelRefundNo: result.channelRefundNo },
+          });
+        }
 
         // ---------- 步骤 2：订单累计退款额 + 状态推进 ----------
         // 整单退直接 REFUNDED；部分退保持原状态，**仅当累计退款额达到实付**才置 REFUNDED（F9.2）
@@ -514,6 +539,8 @@ export class RefundService {
         // ---------- 步骤 7：幂等记录收尾 ----------
         // TODO(T080-B)：IdempotencyService 接入后在此把 scope=REFUND_EXEC / key=REFUND_EXEC:{refundNo}
         // 的记录置 SUCCESS（F9.1 ③🛡 与 ④ 最后一步）。本批只做领域层，不依赖外部幂等组件。
+        // 注：CHANNEL 渠道退款的**适配器接缝**已在同方法步骤 6 接好（缺口 #3），剩余真实凭据
+        // 接入（RealRefundAdapter 调渠道退款 API 并写 channel_refund_no）是下一批，不属于本 seam。
       },
       { label: 'refund.execute' },
     );
@@ -823,6 +850,7 @@ export class RefundService {
       type: refund.type,
       amount: refund.amount,
       refundTo: refund.refundTo,
+      paymentNo: refund.paymentNo,
     };
   }
 
@@ -837,7 +865,14 @@ export class RefundService {
   private async loadExecutingOrder(tx: TxClient, orderId: bigint): Promise<ExecutingOrder> {
     const order = await tx.order.findUnique({
       where: { id: orderId },
-      select: { id: true, orderNo: true, status: true, payAmount: true, refundedAmount: true },
+      select: {
+        id: true,
+        orderNo: true,
+        status: true,
+        payAmount: true,
+        refundedAmount: true,
+        payMethod: true,
+      },
     });
     if (order === null) {
       throw new NotFoundError('订单不存在', { code: ErrorCode.ORDER_NOT_FOUND });
@@ -848,6 +883,7 @@ export class RefundService {
       status: order.status,
       payAmount: order.payAmount,
       refundedAmount: order.refundedAmount,
+      payMethod: order.payMethod,
     };
   }
 

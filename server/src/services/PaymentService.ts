@@ -57,7 +57,7 @@ import { logWarn } from '@/core/logger/logger';
 import { getPrisma } from '@/core/prisma';
 import { withTransaction } from '@/core/transaction';
 import { FundService, type TxClient } from '@/services/FundService';
-import { buildChannelPayUrl } from '@/services/payment/paymentRouter';
+import { buildConfiguredPayUrl } from '@/services/payment/configuredPaymentAdapter';
 import { StockService } from '@/services/StockService';
 
 /** 本服务用到的 Prisma 委托（单测注入假实现时只需实现这些） */
@@ -828,7 +828,7 @@ export class PaymentService {
    * @returns 收银台地址
    */
   private buildPayUrl(paymentNo: string, channel: PayChannel): string {
-    return buildChannelPayUrl(channel, { paymentNo });
+    return buildConfiguredPayUrl(channel, { paymentNo });
   }
 }
 
