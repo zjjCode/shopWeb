@@ -85,3 +85,30 @@
 3. 集成测试重点：并发抢库存、重复回调幂等、优惠分摊尾差、余额负债对账
 
 **积分体系**为第二阶段，已预留扩展点（订单完成事件钩子、`account_type` 多账户、`PriceService` 任意扣减项），本期不实现。
+
+---
+
+## 七、四缺口收口完成记录（2026-09-17）
+
+> 一次性收口四项并「全部完成」，已提交并推送 `origin/master`（`1f2f0cf..1f5e694`）。
+
+| 缺口 | 结论 | 改动 | 验证 |
+| --- | --- | --- | --- |
+| **#1 售后期字段** | ✅ 已闭环，**无需改代码** | 仅文档 | `orders.after_sale_expire_at` 经 `OrderService`→`OrderStateMachine.transition`(L114) 的 `extraData` 落库；`orderShip.spec.ts:179` 已断言（completedAt+7天）。原 backlog「未写入」与现状不符，作废 |
+| **#2/#3 真实/退款渠道适配器** | ✅ 接缝层面收口 | 服务端 commit `20ae241`（8 文件） | `tsc` 0 错误；6 套件 106 测全绿；`paymentRouter.ts` 零 `@/config` 依赖 |
+| **前端门禁** | ✅ 以 `tsc` 为约定 | `web/package.json` | `vue-tsc --noEmit` 0 error |
+| **#4 未规划电商模块排期** | ✅ roadmap 产出 | `docs/11-roadmap-ecommerce-modules.md` | 11 个未规划模块 + 阶段 12→17 排期 |
+
+### 关键约束（后续务必遵守）
+- **`server/src/services/payment/paymentRouter.ts` 必须保持零 `@/config` 依赖**——其 `paymentRouter.spec.ts` 不 mock config，引入 `@/config` 会因 `parseEnv()` 在无 `.env` 环境整轮 jest 崩溃。配置驱动的适配器选择在 `configuredPaymentAdapter.ts`（已 import `@/config`，其 spec 已 mock）。
+- 真实适配器缺凭据时**显式抛错，绝不静默把真实渠道降级为 MOCK**（§6.7 红线）。
+
+### 遗留（明确为后续批次，非本次缺口）
+- `RealPaymentAdapter` / `RealRefundAdapter` 仅骨架：真实网关签名、回调验签、异步退款同步、重试 Worker 待渠道密钥就绪后接入；
+- 环境仍无 MySQL/Redis 实例，资金链路与集成测试未做真实验证。
+
+### 主要产物
+- `docs/10-缺口收口记录.md` — 四缺口结论与证据
+- `docs/11-roadmap-ecommerce-modules.md` — 未规划电商模块分阶段排期
+- `server/src/services/payment/configuredPaymentAdapter.ts` / `refundAdapter.ts` — 适配器接缝
+- `docs/06-开发进度.md` / `docs/07-开发流程记录.md`（log-013）— 进度与流程同步
