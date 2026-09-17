@@ -23,5 +23,5 @@ export const balanceApi = {
     return api.get<PageResult<BalanceTransaction>>('/balance/transactions', params);
   },
   createRecharge: (payload: RechargePayload) =>
-    api.post<{ rechargeNo: string; amount: number; payUrl: string }>('/balance/recharges', payload),
+    api.post<{ rechargeNo: string; paymentNo: string; amount: number; payUrl: string }>('/balance/recharges', payload),
 };

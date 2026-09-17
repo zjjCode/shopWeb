@@ -4,6 +4,7 @@
  * @description 我的余额：账户余额、流水、充值。
  */
 import { onMounted, reactive, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus';
 import { balanceApi } from '@/api/balance';
 import type { BalanceAccount, BalanceTransaction } from '@/api/types';
@@ -21,6 +22,7 @@ const txLoading = ref(false);
 const dialogVisible = ref(false);
 const formRef = ref<FormInstance>();
 const submitting = ref(false);
+const router = useRouter();
 
 interface RechargeForm {
   amountYuan: number;
@@ -68,10 +70,17 @@ async function submitRecharge(): Promise<void> {
   if (!valid) return;
   submitting.value = true;
   try {
-    await balanceApi.createRecharge({ amount: parseYuanToFen(form.amountYuan), payMethod: form.payMethod });
-    ElMessage.success('充值单已创建，实际支付链路为后续任务');
+    const res = await balanceApi.createRecharge({
+      amount: parseYuanToFen(form.amountYuan),
+      payMethod: form.payMethod,
+    });
     dialogVisible.value = false;
-    await loadBalance();
+    // 按渠道跳转收银台：后端 payUrl 已渠道化（/mock-pay/{channel}?paymentNo=...）。
+    // 补充 amount / rechargeNo 供收银台触发 mock 回调（金额须与支付单严格相等才能入账）。
+    await router.push({
+      path: res.payUrl.split('?')[0],
+      query: { paymentNo: res.paymentNo, amount: res.amount, rechargeNo: res.rechargeNo },
+    });
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '充值失败');
   } finally {

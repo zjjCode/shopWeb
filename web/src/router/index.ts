@@ -23,6 +23,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'refund/:refundNo', name: 'refund-detail', component: () => import('@/views/RefundDetailView.vue'), meta: { requiresAuth: true, title: '退款详情' } },
       { path: 'address', name: 'address', component: () => import('@/views/AddressView.vue'), meta: { requiresAuth: true, title: '收货地址' } },
       { path: 'balance', name: 'balance', component: () => import('@/views/BalanceView.vue'), meta: { requiresAuth: true, title: '我的余额' } },
+      { path: 'mock-pay/:channel', name: 'mock-pay', component: () => import('@/views/MockPayView.vue'), meta: { requiresAuth: true, title: '收银台' } },
       { path: 'profile', name: 'profile', component: () => import('@/views/ProfileView.vue'), meta: { requiresAuth: true, title: '个人中心' } },
     ],
   },
