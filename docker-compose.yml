@@ -1,0 +1,59 @@
+# ============================================================================
+# shopWeb · Docker 编排（仅基础设施：MySQL 8 + Redis）
+# ----------------------------------------------------------------------------
+# 推荐用法（方案 A）：只用 Docker 提供 MySQL 8 与 Redis，server / web 仍在本机
+# 原生运行（npm run dev）。优点：调试方便、Vite 代理 localhost:3000 无需改动、
+# 不依赖镜像构建。
+#
+# 启动：
+#   docker compose up -d          # 拉起 db + redis
+#   docker compose ps             # 查看状态（等 healthy）
+#   docker compose down           # 停止并保留数据卷
+#   docker compose down -v        # 停止并清空数据卷（慎用，会删库）
+#
+# 如需“全家桶”式全容器化（server / web 也进容器），见 docs/docker-startup.md 方案 B。
+# ============================================================================
+
+services:
+  db:
+    image: mysql:8.0.36
+    container_name: shopweb-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pwd_change_me
+      MYSQL_DATABASE: shop_web
+      MYSQL_USER: shop
+      MYSQL_PASSWORD: shop_pwd_change_me
+    ports:
+      - "3306:3306"
+    volumes:
+      - shopweb_mysql_data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_pwd_change_me"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: shopweb-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - shopweb_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  shopweb_mysql_data:
+  shopweb_redis_data:
