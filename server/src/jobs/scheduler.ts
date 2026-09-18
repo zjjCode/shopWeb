@@ -25,14 +25,28 @@ import { config } from '@/config';
 import { QUEUE_NAMES } from '@/config/constants';
 import { getQueueConnection } from '@/core/queue';
 import { logError, logInfo } from '@/core/logger/logger';
+import { tryAcquireLock } from '@/core/distLock';
 import { closeTimeoutOrder, scanExpiredOrders } from './handlers/closeTimeoutOrder.job';
 import { autoConfirmReceipt, scanReceivableOrders } from './handlers/autoConfirmReceipt.job';
+import { retryRefund, scanFailedRefunds } from './handlers/retryRefund.job';
 
 /** cron 兜底扫描间隔（毫秒）：F7.2 规定 1 分钟 */
 const SCAN_INTERVAL_MS = 60_000;
 
 /** 自动确认收货 cron 兜底扫描间隔（毫秒）：F10 规定 1 小时 */
 const AUTO_CONFIRM_SCAN_INTERVAL_MS = 3_600_000;
+
+/** 退款重试 cron 兜底扫描间隔（毫秒）：F9.2 规定 1 分钟 */
+const RETRY_SCAN_INTERVAL_MS = 60_000;
+
+/** 关单兜底扫描锁 TTL（毫秒）：> 关单扫描间隔（60s），防多实例重复关单 */
+const CLOSE_LOCK_TTL_MS = 90_000;
+
+/** 自动确认兜底扫描锁 TTL（毫秒）：> 自动确认扫描间隔（60min），防多实例重复确认 */
+const AUTO_CONFIRM_LOCK_TTL_MS = 3_660_000;
+
+/** 退款重试兜底扫描锁 TTL（毫秒）：> 退款重试扫描间隔（60s），防多实例重复重试 */
+const RETRY_LOCK_TTL_MS = 90_000;
 
 /** 延迟关单 job 的处理并发（对齐 QUEUE_LIMITS[ORDER_CLOSE].concurrency） */
 const CLOSE_CONCURRENCY = 3;
@@ -45,6 +59,9 @@ let scanTimer: ReturnType<typeof setInterval> | null = null;
 
 /** 自动确认兜底扫描定时器 */
 let autoConfirmTimer: ReturnType<typeof setInterval> | null = null;
+
+/** 退款重试兜底扫描定时器 */
+let retryTimer: ReturnType<typeof setInterval> | null = null;
 
 /** BullMQ Worker（消费延迟关单 job） */
 let closeWorker: Worker | null = null;
@@ -100,6 +117,11 @@ export function startScheduler(): void {
 
   // ② cron 兜底扫描（F7.2 触发方式 B，防 job 丢失 / 服务重启）
   const tick = async (): Promise<void> => {
+    // 多实例防重：同一时刻只允许一个实例执行扫描，失败/无 Redis 则降级放行（DB 条件更新兜底幂等）
+    const acquired = await tryAcquireLock('job:close-timeout-order', CLOSE_LOCK_TTL_MS);
+    if (!acquired) {
+      return;
+    }
     try {
       const orderNos = await scanExpiredOrders();
       for (const orderNo of orderNos) {
@@ -134,6 +156,11 @@ export function startScheduler(): void {
 
   // ④ 自动确认 cron 兜底扫描（F7.2 触发方式 B，每小时；防 job 丢失 / 服务重启）
   const autoTick = async (): Promise<void> => {
+    // 多实例防重：同一时刻只允许一个实例执行扫描
+    const acquired = await tryAcquireLock('job:auto-confirm-receipt', AUTO_CONFIRM_LOCK_TTL_MS);
+    if (!acquired) {
+      return;
+    }
     try {
       const orderNos = await scanReceivableOrders();
       for (const orderNo of orderNos) {
@@ -149,6 +176,31 @@ export function startScheduler(): void {
 
   void autoTick(); // 启动即补偿一次（覆盖服务重启期间堆积的待确认单）
   autoConfirmTimer = setInterval(autoTick, AUTO_CONFIRM_SCAN_INTERVAL_MS);
+
+  // ⑤ 退款重试 cron 兜底扫描（F9.2 触发方式 B，每分钟；多实例加锁防重复重试）
+  const retryTick = async (): Promise<void> => {
+    // 多实例防重：同一时刻只允许一个实例执行重试扫描
+    const acquired = await tryAcquireLock('job:retry-refund', RETRY_LOCK_TTL_MS);
+    if (!acquired) {
+      return;
+    }
+    try {
+      const refundNos = await scanFailedRefunds();
+      for (const refundNo of refundNos) {
+        // 逐单捕获：单笔失败不影响其他退款单，错误已在 job 内记录
+        try {
+          await retryRefund(refundNo);
+        } catch (error) {
+          logError('scheduler.retry_refund_failed', error, { ctx: { refundNo } });
+        }
+      }
+    } catch (error) {
+      logError('scheduler.retry_scan_failed', error);
+    }
+  };
+
+  void retryTick(); // 启动即补偿一次（覆盖服务重启期间堆积的可重试失败单）
+  retryTimer = setInterval(retryTick, RETRY_SCAN_INTERVAL_MS);
 }
 
 /**
@@ -164,6 +216,10 @@ export async function stopScheduler(): Promise<void> {
   if (autoConfirmTimer !== null) {
     clearInterval(autoConfirmTimer);
     autoConfirmTimer = null;
+  }
+  if (retryTimer !== null) {
+    clearInterval(retryTimer);
+    retryTimer = null;
   }
   if (closeWorker !== null) {
     const worker = closeWorker;

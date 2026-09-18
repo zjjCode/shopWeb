@@ -125,6 +125,27 @@ export const SECURITY_RULE = {
   PASSWORD_MAX_LENGTH: 64,
 } as const;
 
+/** 退款重试规则（F9.2 失败重试策略；T080-D 重试 Worker 依据） */
+export const REFUND_RULE = {
+  /** 重试退避基数（毫秒）：首次失败后延迟 1 分钟再重试 */
+  RETRY_BASE_MS: 60_000,
+  /** 重试退避上限（毫秒）：延迟封顶 1 小时，避免指数翻倍无限膨胀 */
+  RETRY_CAP_MS: 3_600_000,
+  /** 最大重试次数：超过后标记为终态，转人工处理（不再被扫描命中） */
+  RETRY_MAX: 8,
+  /**
+   * 指数退避：第 attempt 次失败后，下一次重试的延迟（毫秒）。
+   *
+   * @description `min(BASE * 2^(attempt-1), CAP)`：1→60s, 2→120s, 3→240s … 封顶 1h。
+   * `attempt` = 本次失败后的累计失败次数（即 `retry_count` 的新值），与 `markChannelFailed` 对齐：
+   * 该方法先 `increment` 再据新值算 `next_retry_at`，二者口径一致。
+   * @param attempt 累计失败次数（>=1）
+   * @returns 下次重试延迟（毫秒）
+   */
+  backoffMs: (attempt: number): number =>
+    Math.min(REFUND_RULE.RETRY_BASE_MS * 2 ** (Math.max(attempt, 1) - 1), REFUND_RULE.RETRY_CAP_MS),
+} as const;
+
 /** 分页与导出规则（与 config/constants.PAGING 保持一致的语义出口） */
 export const LIST_RULE = {
   /** 默认页码 */

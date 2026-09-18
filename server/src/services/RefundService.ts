@@ -51,9 +51,11 @@ import {
 import {
   BusinessError,
   ConflictError,
+  ExternalServiceError,
   NotFoundError,
 } from '@/core/errors';
 import { ErrorCode } from '@/core/errors/errorCodes';
+import { REFUND_RULE } from '@/constants/bizRules';
 import { config } from '@/config';
 import { resolveRefundAdapter } from '@/services/payment/refundAdapter';
 import { IdGenerator } from '@/core/idGenerator';
@@ -612,10 +614,74 @@ export class RefundService {
    * @returns void
    */
   async markChannelFailed(refundNo: string, reason: string): Promise<void> {
-    await this.prisma.refund.updateMany({
-      where: { refundNo, status: RefundStatus.PROCESSING },
-      data: { status: RefundStatus.FAILED, failReason: reason, retryCount: { increment: 1 } },
+    const current = await this.prisma.refund.findFirst({
+      where: { refundNo },
+      select: { retryCount: true },
     });
+    // attempt = 本次失败后的累计失败次数（即 retry_count 的新值），与 REFUND_RULE.backoffMs 对齐
+    const attempt = (current?.retryCount ?? 0) + 1;
+    const nextRetryAt =
+      attempt > REFUND_RULE.RETRY_MAX ? null : new Date(Date.now() + REFUND_RULE.backoffMs(attempt));
+
+    await this.prisma.refund.updateMany({
+      where: { refundNo, status: { in: [RefundStatus.PROCESSING, RefundStatus.FAILED] } },
+      data: {
+        status: RefundStatus.FAILED,
+        failReason: reason,
+        retryCount: { increment: 1 },
+        nextRetryAt,
+      },
+    });
+  }
+
+  /**
+   * 重试一笔 FAILED 的退款单（T080-D 重试 Worker 入口）。
+   *
+   * @description 仅对「CHANNEL 渠道退款」有意义：一期 Mock 抛 41004 后退款单停在 FAILED，
+   * 真实网关接入后由本方法重新触发 `execute`。状态机：
+   *   FAILED --(re-arm)--> PROCESSING --(execute)--> SUCCESS
+   *   FAILED --(execute 再抛 41004)--> markChannelFailed --> FAILED（retry_count+1，next_retry_at 退避）
+   * 守卫（保证并发 / 终态安全，绝不重复退钱）：
+   * - 退款单不存在 或 非 FAILED（已被人工 SUCCESS / REJECTED，或被并发领走）→ 'skipped'
+   * - retry_count >= RETRY_MAX → 'exhausted'（终态，转人工，扫描不再命中）
+   * - re-arm 条件更新落空（并发被别人领走）→ 'skipped'
+   * 复用 {@link execute} 而非重复实现结算体（步骤 2-7），避免两处记账漂移（资损红线）。
+   * @param refundNo 退款单号
+   * @returns 'retried'（已重新执行，结果看退款单最终状态）/ 'skipped' / 'exhausted'
+   */
+  async retry(refundNo: string): Promise<'retried' | 'skipped' | 'exhausted'> {
+    const refund = await this.prisma.refund.findFirst({
+      where: { refundNo },
+      select: { status: true, retryCount: true },
+    });
+    if (refund === null || refund.status !== RefundStatus.FAILED) {
+      return 'skipped';
+    }
+    if (refund.retryCount >= REFUND_RULE.RETRY_MAX) {
+      return 'exhausted';
+    }
+
+    // 重新武装：FAILED → PROCESSING（条件更新即并发闸门，落空即被别人领走）
+    const rearmed = await this.prisma.refund.updateMany({
+      where: { refundNo, status: RefundStatus.FAILED },
+      data: { status: RefundStatus.PROCESSING },
+    });
+    if (rearmed.count === 0) {
+      return 'skipped';
+    }
+
+    try {
+      await this.execute(refundNo);
+      return 'retried';
+    } catch (error) {
+      // 仍是渠道退款失败（41004）：补偿写 FAILED + 退避 next_retry_at；
+      // 命中 RETRY_MAX 后 nextRetryAt=null，扫描不再命中（转人工）。
+      if (error instanceof ExternalServiceError && error.code === ErrorCode.REFUND_EXEC_FAILED) {
+        await this.markChannelFailed(refundNo, (error as Error).message);
+        return 'retried';
+      }
+      throw error;
+    }
   }
 
   // --------------------------------------------------------------------------
