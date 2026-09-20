@@ -51,6 +51,7 @@ import { orderRouter } from '@/routes/api/order.routes';
 import { paymentRouter } from '@/routes/api/payment.routes';
 import { productRouter } from '@/routes/api/product.routes';
 import { refundRouter } from '@/routes/api/refund.routes';
+import { userRouter } from '@/routes/api/user.routes';
 import { adminAuthRouter } from '@/routes/admin/adminAuth.routes';
 import { adminRefundRouter } from '@/routes/admin/refund.routes';
 import { adminOrderRouter } from '@/routes/admin/order.routes';
@@ -176,6 +177,8 @@ export function createApp(): Application {
   app.use('/api', paymentRouter);
   // 退款：/api/refunds（申请 / 列表 / 详情，C 端用户私有资金数据）
   app.use('/api', refundRouter);
+  // 用户：/api/user（当前用户的支付密码设置 / 修改，C 端用户私有安全数据）
+  app.use('/api', userRouter);
   // 后台退款审核：/admin/refunds/:refundNo/audit（审核 + 触发执行）
   app.use('/admin', adminRefundRouter);
   // 后台发货：/admin/orders/:orderNo/ship（F10 ①，rbac(admin:order:ship)）

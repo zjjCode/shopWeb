@@ -37,6 +37,7 @@ export const ErrorCode = {
   RESOURCE_FORBIDDEN: 10009,
   PERMISSION_DENIED: 10010,
   LOGIN_TOO_MANY_ATTEMPTS: 10011,
+  USER_NOT_FOUND: 10012,
 
   // ---------------- 11xxx 收货地址 ----------------
   ADDRESS_NOT_FOUND: 11001,
@@ -124,6 +125,7 @@ export const ErrorCode = {
   PAY_PASSWORD_LOCKED: 61008,
   PAY_PASSWORD_NOT_SET: 61009,
   BALANCE_NEGATIVE: 61010,
+  PAY_PASSWORD_ALREADY_SET: 61011,
 
   // ---------------- 70xxx 后台管理与权限 ----------------
   SUPER_ADMIN_ONLY: 70001,
@@ -179,6 +181,7 @@ export const ERROR_META: Record<ErrorCodeValue, ErrorMeta> = {
   [ErrorCode.PHONE_REGISTERED]: { httpStatus: 409, message: '手机号已注册' },
   [ErrorCode.BAD_CREDENTIALS]: { httpStatus: 401, message: '账号或密码错误' },
   [ErrorCode.ACCOUNT_DISABLED]: { httpStatus: 403, message: '账号已被禁用' },
+  [ErrorCode.USER_NOT_FOUND]: { httpStatus: 404, message: '账号不存在' },
   [ErrorCode.ACCESS_TOKEN_EXPIRED]: { httpStatus: 401, message: '登录已失效，请重新登录' },
   [ErrorCode.REFRESH_TOKEN_REVOKED]: { httpStatus: 401, message: 'Refresh Token 无效或已吊销' },
   [ErrorCode.REFRESH_TOKEN_EXPIRED]: { httpStatus: 401, message: 'Refresh Token 已过期' },
@@ -261,6 +264,7 @@ export const ERROR_META: Record<ErrorCodeValue, ErrorMeta> = {
   [ErrorCode.PAY_PASSWORD_INCORRECT]: { httpStatus: 401, message: '支付密码错误' },
   [ErrorCode.PAY_PASSWORD_LOCKED]: { httpStatus: 429, message: '支付密码错误次数过多，账户已临时锁定' },
   [ErrorCode.PAY_PASSWORD_NOT_SET]: { httpStatus: 409, message: '未设置支付密码，请先设置' },
+  [ErrorCode.PAY_PASSWORD_ALREADY_SET]: { httpStatus: 409, message: '支付密码已设置，请使用修改接口' },
   [ErrorCode.BALANCE_NEGATIVE]: { httpStatus: 409, message: '余额账户余额不可为负' },
 
   [ErrorCode.SUPER_ADMIN_ONLY]: { httpStatus: 403, message: '仅超级管理员可执行该操作' },

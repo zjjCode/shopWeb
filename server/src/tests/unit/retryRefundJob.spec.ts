@@ -53,7 +53,7 @@ type AnyAsyncFn = (...args: any[]) => Promise<any>;
 describe('退款重试 Job + 分布式锁（T080-D / T091）', () => {
 const prismaMock = getPrisma as unknown as jest.Mock;
 const redisMock = getRedis as unknown as jest.Mock;
-const retryFn = refundService.retry as unknown as jest.Mock;
+const retryFn = refundService.retry as unknown as jest.Mock<AnyAsyncFn>;
 
   beforeEach(() => {
     jest.clearAllMocks();

@@ -15,7 +15,7 @@
 | T012 | 动态 RBAC（后台权限台） | ⬜ 待处理 |
 | T021-B | 后台商品/SKU/库存管理 | 🟡 部分（缺后台接口） |
 | T041 | 优惠券领取/状态机 + 促销管理 | ⬜ 待处理 |
-| T070 | 余额账户 + 充值 + 余额支付/退款 API | ⬜ 待处理 |
+| T070 | 余额账户 + 充值 + 余额支付/退款 API（+ 支付密码设置/修改） | ✅ 余额/充值/退款 API 已具备；支付密码接线(后端)✅；前端⬜ |
 | T080 | 退款申请/审核/执行 + 重试 Worker | 🟢 进行中（主链路✅+重试✅；管理台见 T091） |
 | T090 | 双视图对账 ReconciliationService | ⬜ 待处理 |
 | T091 | 后台支付方式管理 + 定时任务 | 🟢 进行中（调度+分布式锁✅；管理台待做） |
@@ -45,7 +45,7 @@
 **目标**：把「下单 → 支付 → 退款 → 对账」资金链路从代码层补全到可运营。
 | 模块 | 核心功能 | 关键产出 | 依赖 | 工作量 |
 | --- | --- | --- | --- | --- |
-| T070 余额/充值 API | 余额开户/明细、充值建单（委托 `buildConfiguredPayUrl`）、余额支付/退款（复用 `FundService.recordBalancePayment/Refund`） | `BalanceService`/`RechargeService` API + 控制器/路由 | 缺口 #2/#3 接缝（已完成）、`FundService` | 2 批次 |
+| T070 余额/充值 API | 余额开户/明细、充值建单（委托 `buildConfiguredPayUrl`）、余额支付/退款（复用 `FundService.recordBalancePayment/Refund`）；余额支付前支付密码校验（`requireBalancePassword` + Redis 失败计数锁定）；`POST/PUT /api/user/pay-password`（设置/修改） | `BalanceService`/`RechargeService`/`PayPasswordService` API + 控制器/路由 | 缺口 #2/#3 接缝（已完成）、`FundService` | ✅ 后端已完成；前端⬜ |
 | T080 退款审核/重试 | 退款申请/审核流转、CHANNEL 退款经 `RefundAdapter`、重试 Worker（`retryRefund.job.ts`）接 `markChannelFailed` 指数退避 | `RefundService` 补全 + `jobs/handlers/retryRefund.job.ts` | 缺口 #3 接缝、T091 调度 | 2 批次 |
 | T090 对账 | 用户余额账户 + 平台账户双视图对账，恒等式 L1/L2/L3 校验 | `ReconciliationService` + 后台对账页 API | `FundService` 流水 | 1.5 批次 |
 | T091 后台支付/任务 | 支付方式管理台、`closeTimeoutOrder`/`autoConfirm`/`retryRefund` 调度落地 + 分布式锁选主 | `jobs/*` 补全、`AdminPaymentMethodController` | 配置 `adapter.payment.provider` | 1.5 批次 |

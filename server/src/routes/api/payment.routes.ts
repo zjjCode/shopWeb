@@ -31,8 +31,10 @@ import { asyncHandler } from '@/middlewares/asyncHandler';
 import { auth } from '@/middlewares/auth';
 import { idempotency } from '@/middlewares/idempotency';
 import { rateLimit } from '@/middlewares/rateLimit';
+import { requireBalancePassword } from '@/middlewares/balancePassword';
 import { validate } from '@/middlewares/validate';
 import {
+  balancePaySchema,
   createPaymentSchema,
   mockPaidSchema,
   paymentNoParamSchema,
@@ -82,11 +84,14 @@ export function createPaymentRouter(): Router {
   }
 
   // 余额支付（同步扣款，F6.6 负债结转对）：真实功能，全环境注册（不依赖任何外部渠道）
+  // 余额支付前必须校验支付密码（二次确认）：validate 先保字段非空，requireBalancePassword
+  // 再做「锁定 → 是否已设置 → 比对」完整校验；校验器在 bootstrap 注册（见 server.ts）。
   router.post(
     '/payments/:paymentNo/balance-pay',
     auth({ scope: 'shop' }),
     payCreateRateLimit(),
-    validate({ params: paymentNoParamSchema }),
+    validate({ params: paymentNoParamSchema, body: balancePaySchema }),
+    requireBalancePassword('payPassword'),
     asyncHandler(paymentController.balancePay),
   );
 

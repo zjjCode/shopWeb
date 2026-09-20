@@ -1,6 +1,6 @@
 # 阶段 12 · 资金域闭环 — 实现方案（T070 / T080 / T090 / T091）
 
-> 最后更新：2026-09-18 ｜ 范围：路线图 `docs/11-roadmap-ecommerce-modules.md` 阶段 12
+> 最后更新：2026-09-20 ｜ 范围：路线图 `docs/11-roadmap-ecommerce-modules.md` 阶段 12
 > 目标：把「下单 → 支付 → 退款 → 对账」资金链路从代码层补全到**可运营**。
 > 约束：本沙箱无 MySQL/Redis/Docker，仅能做 `tsc` + 单测；**真实验证需在你本机 Docker 上跑**（见 `docs/docker-startup.md`）。
 
@@ -42,8 +42,9 @@
      - `scheduler.ts`：注册 retryRefund Worker + cron 兜底（**带 Redis 分布式锁 `SET NX PX` 选主**，T091 锁）。
      - 单测：mock adapter 成功/失败、退避到点、重试封顶。
    - 不碰 schema（`nextRetryAt` 字段已存在）。
-2. **T070 支付密码接线（安全收口）**
-   - `balance-pay` 路由挂 `requireBalancePassword`；`bootstrap` 注册 `setPayPasswordHandlers`（compare + 是否设密码）；新增"设置/修改支付密码" API + 前端；`validators` 补 `payPassword` 校验。
+2. **T070 支付密码接线（安全收口）** ✅ 后端已完成（2026-09-20）
+   - `balance-pay` 路由挂 `requireBalancePassword('payPassword')` + `validate({ params: paymentNoParamSchema, body: balancePaySchema })`（`validators` 补 `payPassword` 校验）；`bootstrap`（`server.ts`）注册 `setPayPasswordHandlers`（verify=比对哈希 + checker=是否已设置）；新增 `POST /api/user/pay-password`（首次设置，已设则 61011 拒绝）+ `PUT /api/user/pay-password`（修改，需旧密码）；`PayPasswordService` 复用 `utils/hash` 的 `bcrypt(sha256)` 同一套哈希工具。
+   - **前端（设置/修改支付密码 UI）本次未做**，列为后续；接口契约已就绪。
 3. **T070 充值单查询 + 超时关单**
    - `RechargeService.list` + `GET /balance/recharges` + 前端充值记录 tab；新增充值超时关单 Worker（消费 `expireAt` → PENDING→CLOSED）。
 4. **T090 双视图对账**
@@ -94,3 +95,48 @@
 - **`execute` 全链路无条件 `recordBalanceRefund`（步骤 6）对 CHANNEL 退款是潜在双付隐患**：本期因 Mock 永远抛 41004、事务回滚，`recordBalanceRefund` 永不触达 CHANNEL 成功分支，故安全。真实网关接入（下一批）时**必须**让 `recordBalanceRefund` 仅对 BALANCE 退款/平台负债结转生效，CHANNEL 走渠道流水——此为缺口 #3 接缝批次的硬收口项，已在 `docs/10-缺口收口记录.md:81` 标注。
 - **分布式锁仅自动过期（PX），不主动释放**：TTL > 扫描间隔即可，standby 实例最多干等一个 TTL；与 `scheduler.ts:17` 原注释口径一致，够用且不引入 token+Lua 复杂度。
 - **IdempotencyService 收尾仍未接**（T080-B 标注 TODO）：当前靠 `execute` 的条件更新闸门兜底幂等，`retry` 的 re-arm 也是条件更新，重复执行安全。
+
+---
+
+## 五、本批交付（第二批：T070 支付密码接线，2026-09-20 提交）
+
+> 范围：阶段 12 推荐构建顺序 #2 的**后端**部分。前端（设置/修改支付密码 UI）未做，列为后续批次。
+
+### 5.1 已落地文件
+
+| 文件 | 改动 |
+| --- | --- |
+| `server/src/core/errors/errorCodes.ts` | 新增错误码 `USER_NOT_FOUND: 10012`（10xxx 段，404）+ `PAY_PASSWORD_ALREADY_SET: 61011`（61xxx 段，409）及 `ERROR_META` |
+| `server/src/services/PayPasswordService.ts` | **新增** `verify / hasPassword / set / modify`：复用 `utils/hash` 的 `bcrypt(sha256)`；`set` 已设即 61011 拒绝；`modify` 先校验原密码防越权改密；强度不足统一抛 `PAY_PASSWORD_INCORRECT` |
+| `server/src/validators/payPassword.validator.ts` | **新增** `setPayPasswordSchema` / `modifyPayPasswordSchema`（strict，复用 `isPasswordStrong`） |
+| `server/src/controllers/PayPasswordController.ts` | **新增** `set / modify`（取 `req.auth.userId`） |
+| `server/src/routes/api/user.routes.ts` | **新增** `POST /api/user/pay-password`（设置）+ `PUT /api/user/pay-password`（修改），均挂 `auth + defaultRateLimit + validate + controller` |
+| `server/src/validators/payment.validator.ts` | 新增 `balancePaySchema`（`payPassword` 必填） |
+| `server/src/routes/api/payment.routes.ts` | `balance-pay` 路由挂 `validate({ params, body: balancePaySchema })` + `requireBalancePassword('payPassword')` |
+| `server/src/app.ts` | 挂载 `userRouter`（`/api`） |
+| `server/src/server.ts` | `bootstrap` 注册 `setPayPasswordHandlers((userId,plain)=>payPasswordService.verify, (userId)=>payPasswordService.hasPassword)` |
+| `server/src/tests/unit/payPasswordService.spec.ts` | **新增** `verify/hasPassword/set/modify` 全分支（16 用例） |
+| `server/src/tests/unit/balancePassword.spec.ts` | **新增** 中间件校验顺序 + Redis 失败计数全分支（6 用例） |
+| `server/src/tests/unit/payPasswordRoutes.spec.ts` | **新增** `POST/PUT /user/pay-password` 路由存在性（isolateModules） |
+| `server/src/tests/unit/balancePaySecurity.spec.ts` | **新增** HTTP 级链路：缺密码 400 / 未设 409 / 错密码 409 / 正确 200（supertest） |
+| `server/src/tests/unit/retryRefundJob.spec.ts` | 修正 jest mock 泛型（与范本 `jest.Mock<AnyAsyncFn>` 对齐，tsc 0 error） |
+
+### 5.2 验证结果
+
+- `tsc --noEmit`：**0 error**（全仓，含既有 refund 套件）。
+- `eslint`：**0 error**（仅 9 个与 T070 无关的预存 type-import warning）。
+- `jest --runInBand`：**490/490 全绿**（新增 26 用例，无回归）。
+- 沙箱无 MySQL/Redis：单测用注入假 Prisma / mock `withRedis` + fakeRedis，不连库。
+
+### 5.3 安全收口要点
+
+- **校验顺序**（中间件铁律）：Redis 失败计数锁定（≥5 锁 15min）→ 是否已设置（未设引导设置）→ 字段非空 → 比对哈希；正确时 `del` 失败计数，错误时 `incr + expire`。
+- **防越权改密**：`set` 接口已设密码则 61011 拒绝（必须走 `modify` 验旧密码）；`modify` 先比对原密码再写新哈希。
+- **分层**：`PayPasswordService` 直连 `users` 但独立于 `AuthService`（后者 `toUserPayload` 排除 `payPasswordHash`，不为登录链路暴露）。
+
+### 5.4 遗留 / 待办
+
+- **前端 UI**：设置/修改支付密码的 Web 页面未实现，接口契约已就绪（`POST/PUT /api/user/pay-password`）。
+- **`BusinessError` 默认 `httpStatus: 409` 的潜在不一致**（已确认非本批引入）：`requireBalancePassword` 抛出的 61007（密码错误）/ 61008（锁定）/ 61009（未设）经 `errorHandler` 统一映射为 **409**（因 `BusinessError` 构造函数把 `httpStatus` 默认写死 409，`AppError` 用 `options.httpStatus ?? meta.httpStatus` 取到 409 而非 `ERROR_META` 里的 401/403）。语义上"密码错误"更接近 401，但改动 `BusinessError` 默认会影响全仓大量业务拒绝的契约，**不在本批范围**；本批测试按真实行为断言（用 `body.code` 区分 61007/61009，状态均为 409）。如需修正，应在 `BusinessError` 改为"缺省按 `ERROR_META` 推导、仅在显式传 `httpStatus` 时覆盖"，并评估前端对 409/401 的既有处理。
+- 真实环境验证（本机 Docker）：余额支付前支付密码校验、`set`/`modify` 端到端，待用户按 `docs/docker-startup.md` 跑。
+

@@ -26,6 +26,8 @@ import { closeRedis } from '@/core/redis';
 import { startScheduler, stopScheduler } from '@/jobs/scheduler';
 import { sleep } from '@/utils/sleep';
 import { createApp } from '@/app';
+import { setPayPasswordHandlers } from '@/middlewares/balancePassword';
+import { payPasswordService } from '@/services/PayPasswordService';
 
 /** 等待在途请求的超时上限（毫秒）：超时后强制断开连接，避免进程永远退不掉 */
 const SHUTDOWN_TIMEOUT_MS = 15_000;
@@ -213,6 +215,12 @@ export async function bootstrap(): Promise<void> {
 
   // 启动异步任务调度器（超时关单 Worker + cron 兜底扫描；测试环境自动跳过）
   startScheduler();
+
+  // 注册支付密码校验器：余额支付中间件不直连库，由本服务注入校验逻辑（T070 安全收口）
+  setPayPasswordHandlers(
+    (userId, plain) => payPasswordService.verify(userId, plain),
+    (userId) => payPasswordService.hasPassword(userId),
+  );
 
   registerProcessGuards();
 }

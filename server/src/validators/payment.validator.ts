@@ -94,3 +94,19 @@ export type CreatePaymentInput = z.infer<typeof createPaymentSchema>;
 export type PaymentNoParam = z.infer<typeof paymentNoParamSchema>;
 /** mock 支付确认入参类型 */
 export type MockPaidInput = z.infer<typeof mockPaidSchema>;
+
+/**
+ * 余额支付入参：POST /api/payments/:paymentNo/balance-pay
+ *
+ * @description 只需携带支付密码（payPassword）。余额支付前由 `requireBalancePassword`
+ * 中间件做二次校验（锁定 → 是否已设置 → 比对），此处先做字段级非空校验作为第一道闸门。
+ */
+export const balancePaySchema = z
+  .object({
+    /** 支付密码（明文，由中间件比对，不落库） */
+    payPassword: z.string({ required_error: '请输入支付密码' }).min(1, '请输入支付密码'),
+  })
+  .strict();
+
+/** 余额支付入参类型 */
+export type BalancePayInput = z.infer<typeof balancePaySchema>;
